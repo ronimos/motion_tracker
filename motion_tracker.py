@@ -126,7 +126,7 @@ class Video_utill:
     def set_pxl_size(self):
         '''
         Open a window with the first video's frame and call on_mouse to draw a rectangle,
-        Open an input window to enter the rectangle size in cm and calculates pixle zise
+        Open an input window to enter the rectangle size in cm and calculates pixel zise
         '''        
         zoom = 1
         self.drawing = False
@@ -158,8 +158,8 @@ class Video_utill:
     def track(self):
         '''
         Uses Optical Flow to track movment of features inside the ROI and save
-        the motion between frames (on both x,y axis) in cm if pixle zise is set or in 
-        pixles if not
+        the motion between frames (on both x,y axis) in cm if pixel zise is set or in 
+        pixels if not
         '''
         # Create DataFrame to store motion between frames
         cols = []
