@@ -10,10 +10,10 @@ import cv2
 from tkinter import Tk, simpledialog, Button, messagebox
 from tkinter.filedialog import askopenfilename, asksaveasfilename
 import pandas as pd
-from tqdm import tqdm_gui
+from tqdm import tqdm_gui, tqdm
 import matplotlib.pyplot as plt
 import warnings
-import os
+import argparse
 
 warnings.filterwarnings("ignore")
 
@@ -34,7 +34,7 @@ class Video_utill:
             # params for ShiTomasi corner detection
         self.feature_params = dict( maxCorners = 20,
                                    qualityLevel = .3,
-                                   minDistance = 10,
+                                   minDistance = 15,
                                    blockSize = 7 )
 
         # Parameters for lucas kanade optical flow
@@ -46,18 +46,10 @@ class Video_utill:
         self.mask = self.video_buffer[0].copy()
         self.pix_heigth = 1
         self.pix_width = 1
-        self.track_video = []
+        self.trak_video = []
         self.frame_num = 0
         
     def load_video(self):
-        """
-        Read the video from the disc and load it into a numpy array
-        ---------------------------------------------------------
-        Params:
-            self
-        return:
-            None
-        """
         
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -74,80 +66,51 @@ class Video_utill:
         self.cap = None
         return
 
-    def _on_mouse(self, event, x, y, flag, param):
-        """
-        An internal function that gets called on mouse status chage event on a given window
-        ---------------------------------------------------------
-        Params:
-            self
-            event: (int) - mouse status change code
-            x, y: (int) - mouse location in the active window
-            flag: (int) - unused
-            parram (dict) - unused
-        return:
-            None
-        """      
-        if self.drawing:
-            self.img_copy = self.img.copy()
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self.drawing = True
-            self.ix, self.iy = x, y
-        elif event == cv2.EVENT_MOUSEMOVE:
+    def on_mouse(self,event, x, y, flag, param):
+
             if self.drawing:
-                cv2.rectangle(self.img_copy, (self.ix, self.iy), (x, y), (0, 255, 0), 2)
-            else:
-                self.img_show = self.img_copy.copy()
-            heigth, width = self.img_copy.shape[:2]
-            cv2.line(self.img_show, (0,y), (width, y), (0,0,0), 1)
-            cv2.line(self.img_show, (x,0), (x, heigth), (0,0,0), 1)
-        elif event == cv2.EVENT_LBUTTONUP:
-            if self.drawing:
-                self.drawing = False
-                cv2.rectangle(self.img_copy, (self.ix, self.iy), (x, y), (0, 255, 0), 2)
-                self.ul_cr = (max(min(x, self.ix), 0), max(min(y, self.iy), 0))
-                self.lr_cr = (min(max(x, self.ix), self.img_copy.shape[1]), min(max(y, self.iy), self.img_copy.shape[0]))
-        if self.drawing:
-            self.img_show = cv2.addWeighted(self.img_show, 0.5, self.img_copy, 0.5, 0)
-        return
-  
+                self.img_cp = self.img.copy()
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.drawing = True
+                self.ix, self.iy = x, y
+            elif event == cv2.EVENT_MOUSEMOVE:
+                if self.drawing:
+                    cv2.rectangle(self.img_cp, (self.ix, self.iy), (x, y), (0, 255, 0), 2)
+            elif event == cv2.EVENT_LBUTTONUP:
+                if self.drawing:
+                    self.drawing = False
+                    cv2.rectangle(self.img_cp, (self.ix, self.iy), (x, y), (0, 255, 0), 2)
+                    self.ul_cr = (max(min(x, self.ix), 0), max(min(y, self.iy), 0))
+                    self.lr_cr = (min(max(x, self.ix), self.img_cp.shape[1]), min(max(y, self.iy), self.img_cp.shape[0]))
+            return
+      
     
     def set_roi(self):
-        """
-        Utility function to set area to track
-        ---------------------------------------------------------
-        Params:
-            self
-        return:
-            None
-        """
         def _change_frame(trackbar_val):
             self.frame_num = trackbar_val
             self.img = self.video_buffer[self.frame_num].copy()
-            self.img_copy = self.img.copy()
-            self.img_show = self.img_copy.copy()
+            self.img_cp = self.img.copy()
             
         self.mask = np.zeros_like(self.video_buffer[0])
         zoom = 1
         self.drawing = False
-        window_name = 'Draw a rectangle with around the area you want to track, Click "-" to resize, Esc to exit'
+        window_name = 'Draw a rectangle around the area you want to track, Click "-" to resize, Esc to exit'
         cv2.namedWindow(window_name)
-        cv2.setMouseCallback(window_name, self._on_mouse)
+        cv2.setMouseCallback(window_name, self.on_mouse)
         cv2.createTrackbar("Frame #: ", window_name, 0, self.length, _change_frame)
         self.frame_num=0        
         self.img = self.video_buffer[self.frame_num].copy()
-        self.img_copy = self.img.copy()
-        self.img_show = self.img_copy.copy()
+        self.img_cp = self.img.copy()
         self.ul_cr = (0, 0)
         self.lr_cr = (self.img.shape[1], self.img.shape[0])
         while True:
-            cv2.imshow(window_name, self.img_show)
+            cv2.imshow(window_name, self.img_cp)
             k = cv2.waitKey(20) & 0xFF
             if k == 27:
                 break
             if k == ord('-'):
                 self.img = cv2.resize(self.img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-                self.img_copy = self.img.copy()
-                self.img_show = self.img_copy.copy()
+                self.img_cp = self.img.copy()
                 self.ul_cr = (0, 0)
                 self.lr_cr = (self.img.shape[1], self.img.shape[0])
                 zoom *= 2
@@ -157,33 +120,24 @@ class Video_utill:
     
     
     def set_pxl_size(self):
-        """
-        Utility function to calculate pixle size in cm
-        ---------------------------------------------------------
-        Params:
-            self
-        return:
-            None
-        """
+        
         zoom = 1
         self.drawing = False
-        window_name = 'Draw a rectangle with a known height (in cm), Click "-" to resize, Esc to exit'
+        window_name = 'Draw a rectangle with a known height (in m), Click "-" to resize, Esc to exit'
         cv2.namedWindow(window_name)
-        cv2.setMouseCallback(window_name, self._on_mouse)
+        cv2.setMouseCallback(window_name, self.on_mouse)
         self.img = self.video_buffer[0].copy()
-        self.img_copy = self.img.copy()
-        self.img_show = self.img_copy.copy()
+        self.img_cp = self.img.copy()
         self.ul_cr = (0, 0)
         self.lr_cr = (self.img.shape[1], self.img.shape[0])
         while True:
-            cv2.imshow(window_name, self.img_show)
+            cv2.imshow(window_name, self.img_cp)
             k = cv2.waitKey(20) & 0xFF
             if k == 27:
                 break
             if k == ord('-'):
                 self.img = cv2.resize(self.img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-                self.img_copy = self.img.copy()
-                self.img_show = self.img_copy.copy()
+                self.img_cp = self.img.copy()
                 self.ul_cr = (0, 0)
                 self.lr_cr = (self.img.shape[1], self.img.shape[0])
                 zoom *= 2
@@ -193,7 +147,7 @@ class Video_utill:
         Tk().withdraw()
         
         rect_height = simpledialog.askstring(title = "Get pixel size", 
-                                             prompt = "Entire retcangle heigth in cm", 
+                                             prompt = "Entire retcangle heigth in m", 
                                              initialvalue="Click cancel if unknown")
         try:
             rect_height = float(rect_height)
@@ -203,7 +157,7 @@ class Video_utill:
             
         Tk().withdraw()
         rect_width = simpledialog.askstring(title = "Get pixel size", 
-                                             prompt = "Entire retcangle width in cm", 
+                                             prompt = "Entire retcangle width in m", 
                                              initialvalue="Click cancel if unknown")
         
         try:
@@ -220,17 +174,7 @@ class Video_utill:
             
         
     def track(self):
-        """
-        Utility function to track motion over frames in a video.
-        This function uses Shi-Tomasi corner detector to track and 
-        Lucas-Kanade to track corner morion over the video's frames.
-        The corners morions are saved in csv file.
-        ---------------------------------------------------------
-        Params:
-            self
-        return:
-            None
-        """
+        
         if messagebox.askyesno("", "Do you want to set frames to track?"):
             start, end = self.trim_video(trim=False)
         else:
@@ -243,6 +187,9 @@ class Video_utill:
             cols.append('p' + str(i) + '_y')
         motion = pd.DataFrame(columns=cols)
         color = np.random.randint(0,255,(100,3))
+        #self.cap = cv2.VideoCapture(self.video_file)
+        # Take first frame and find corners in it
+        #ret, old_frame = self.cap.read()
         old_frame = self.video_buffer[start]
         old_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
         mask_gray = cv2.cvtColor(self.mask, cv2.COLOR_BGR2GRAY)
@@ -273,19 +220,17 @@ class Video_utill:
                 if first_frame:
                     font = cv2.FONT_HERSHEY_SIMPLEX
                     mask = cv2.putText(mask, str(i), (a,b), font, 1, color[i].tolist(), 1, lineType = cv2.LINE_AA)
-                if not first_frame:
-                    mask[:100, :400, :] = 0
-                dx2dt = round(((a-c)*self.pix_width)*self.fps, 5)
+                dx2dt = round(((a-c)*self.pix_width)*self.fps/100, 2)
                 speed_x = "dx/dt = {0} m/s".format(dx2dt)
-                dy2dt = round(((b-d)*self.pix_width)*self.fps, 5)
+                dy2dt = round(((b-d)*self.pix_width)*self.fps/100, 2)
                 speed_y = "dy/dt = {0} m/s".format(dy2dt)
-                mask = cv2.putText(mask, speed_x, (5,45), font, 1, (180, 0, 80), 1, lineType = cv2.LINE_AA)
-                mask = cv2.putText(mask, speed_y, (5,80), font, 1, (180, 0, 00), 1, lineType = cv2.LINE_AA)
+                mask = cv2.putText(mask, speed_x, (5,5), font, 1, (255, 0, 0), 1, lineType = cv2.LINE_AA)
+                mask = cv2.putText(mask, speed_y, (5,15), font, 1, (255, 0, 0), 1, lineType = cv2.LINE_AA)
                 mask = cv2.line(mask, (a,b),(c,d), color[i].tolist(), 2)
                 frame = cv2.circle(frame,(a,b),5,color[i].tolist(),-1)
             motion = motion.append(d_motion, ignore_index=True)
             img = cv2.add(frame,mask)
-            self.track_video.append(img)
+            self.trak_video.append(img)
             cv2.imshow('frame',img)
             k = cv2.waitKey(0) & 0xff
             if k == 27:
@@ -322,7 +267,7 @@ class Video_utill:
             save_file: (str) saved video file location and name
         """
         
-        video=self.track_video
+        video=self.trak_video
         filename = self.video_file[:-4]+"_track_.mp4"
         Tk().withdraw()
         save_file = asksaveasfilename(initialfile=filename,
@@ -342,20 +287,6 @@ class Video_utill:
         return save_file
     
     def trim_video(self, trim):
-        """
-        Trim a cideo to between set frames. The frames are set by click "s" for start frame 
-        and "e" for end frame. A track bar and "f" click - for forward one frame and
-        "b" click for back one frame can be used to get to the start and end frames
-        ---------------------------------------------------------
-        Params:
-            self
-            trim (bool) - if True - trim the ogject video buffer
-                          if False - keep the object video buffer 
-                          and return start ans end frames
-        return:
-            start, end: (int) start and end frames numbers 
-        """
-
         def _move(frame_n):
             self.frame_num=frame_n
             
@@ -376,7 +307,7 @@ class Video_utill:
         cv2.setTrackbarPos(track_name, win_name, self.frame_num)
         
         while True:
-            frame = self.video_buffer[self.frame_num-1].copy()
+            frame = self.video_buffer[self.frame_num].copy()
             frame = cv2.resize(frame, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_CUBIC)
             cv2.imshow(win_name, frame)
             k = cv2.waitKey(30) & 0xFF
@@ -385,7 +316,7 @@ class Video_utill:
             if k==ord("e"):
                 end = self.frame_num
             if k==ord("f"):
-                self.frame_num = min(self.frame_num+1, self.length)
+                self.frame_num = min(self.frame_num+1, self.length-1)
             if k==ord("b"):
                 self.frame_num = max(0, self.frame_num-1)
             if k==27:
@@ -489,7 +420,7 @@ class Gui:
         if not self.video_loaded:
             messagebox.showerror('No video selected error', 'Please load video first')
         else:
-            _, _ =self.video.trim_video(trim=True)
+            self.video.trim_video(trim=True)
 
     def play_video(self):
         if not self.video_loaded:
@@ -501,7 +432,21 @@ class Gui:
         self.window.destroy()
 
 
+
+    
+
+ap = argparse.ArgumentParser()
+ap.add_argument("-m", "--mode", default="manual", help="True for automatic mode - manual or aouto")
+ap.add_argument("-v", "--path", default="", help="Path to video file")
+
+
 if __name__=='__main__':
-    #g = Gui()
-    VIDEO_FILE=os.path.join(os.path.dirname(os.getcwd()),"data","00001_Trim.mp4")
-    v=Video_utill(VIDEO_FILE)
+    args = ap.parse_args()
+    if args.mode=="auto":
+        v = Video_utill(args.video_file)
+        v.set_roi()
+        v.set_pxl_size()
+        v.track()
+        v.save_tracking_video(fps=30)
+    else:
+        g = Gui(args)
