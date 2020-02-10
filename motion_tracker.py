@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore")
 Video_utill Class: measure motion of items throughout a video
 '''
 
-class Video_utill:
+class Video_util:
     def __init__(self, video_file=''):
             
         if video_file=='':
@@ -173,8 +173,8 @@ class Video_utill:
         return
             
         
-    def track(self):
-        
+    def track(self, draw_speeds=True):
+        self.trak_video = []
         if messagebox.askyesno("", "Do you want to set frames to track?"):
             start, end = self.trim_video(trim=False)
         else:
@@ -194,15 +194,18 @@ class Video_utill:
         old_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
         mask_gray = cv2.cvtColor(self.mask, cv2.COLOR_BGR2GRAY)
         p0 = cv2.goodFeaturesToTrack(old_gray, mask = mask_gray, **self.feature_params)
-        
+        height, width = old_frame.shape[:2] 
+        ch_h, ch_w = int(height/2), int(width/5)
+        text_x = int(old_frame.shape[1]/100)
+        text_y1 = int(0.1 * height)
+        text_y2 = int(0.13 * height)
         # Create a mask image for drawing purposes
-        mask = np.zeros_like(old_frame)
+        mask = np.zeros_like(old_frame)   
         first_frame = True
-        
-        for idx in range(start, end) :
+        spd_x, spd_y = [],[]
+        for idx in tqdm(range(start, end)):
             frame = self.video_buffer[idx]
             frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
             # calculate optical flow
             p1, st, err = cv2.calcOpticalFlowPyrLK(old_gray, frame_gray, p0, None, **self.lk_params)
         
@@ -212,6 +215,7 @@ class Video_utill:
             
             # save changes in 
             d_motion = {}
+            dxdt,dydt = [],[]
             for i,(new,old) in enumerate(zip(good_new,good_old)):
                 a,b = new.ravel()
                 c,d = old.ravel()
@@ -220,29 +224,62 @@ class Video_utill:
                 if first_frame:
                     font = cv2.FONT_HERSHEY_SIMPLEX
                     mask = cv2.putText(mask, str(i), (a,b), font, 1, color[i].tolist(), 1, lineType = cv2.LINE_AA)
-                dx2dt = round(((a-c)*self.pix_width)*self.fps/100, 2)
-                speed_x = "dx/dt = {0} m/s".format(dx2dt)
-                dy2dt = round(((b-d)*self.pix_width)*self.fps/100, 2)
-                speed_y = "dy/dt = {0} m/s".format(dy2dt)
-                mask = cv2.putText(mask, speed_x, (5,5), font, 1, (255, 0, 0), 1, lineType = cv2.LINE_AA)
-                mask = cv2.putText(mask, speed_y, (5,15), font, 1, (255, 0, 0), 1, lineType = cv2.LINE_AA)
                 mask = cv2.line(mask, (a,b),(c,d), color[i].tolist(), 2)
                 frame = cv2.circle(frame,(a,b),5,color[i].tolist(),-1)
+                dxdt.append((a-c)*self.pix_width*self.fps)
+                dydt.append((b-d)*self.pix_heigth*self.fps)
+                
             motion = motion.append(d_motion, ignore_index=True)
             img = cv2.add(frame,mask)
+            dxdt = 0 if round(np.median(dxdt), 2)==0 else round(np.median(dxdt), 2)
+            dydt = 0 if round(np.median(dydt), 2)==0 else round(np.median(dydt), 2)
+            spd_x.append(abs(dxdt))
+            spd_y.append(abs(dydt))
+            speed_x = "dx/dt = {0} m/s".format(dxdt)
+            speed_y = "dy/dt = {0} m/s".format(dydt)
+            img = cv2.putText(img, speed_x, (text_x, text_y1), font, 1, (0, 0, 255), 1, lineType = cv2.LINE_AA)
+            img = cv2.putText(img, speed_y, (text_x, text_y2), font, 1, (0, 0, 255), 1, lineType = cv2.LINE_AA)
             self.trak_video.append(img)
-            cv2.imshow('frame',img)
-            k = cv2.waitKey(0) & 0xff
-            if k == 27:
-                break
-            if k == ord("f"):
-                idx+=1
         
             # Now update the previous frame and previous points
             old_gray = frame_gray.copy()
             p0 = good_new.reshape(-1,1,2)
             first_frame=False
-        cv2.destroyAllWindows()
+        if draw_speeds:
+            plt.ioff()
+            xspdlim = [0, round(max(spd_x),1) + 0.1]    
+            yspdlim = [0, round(max(spd_y),1) + 0.1]
+            xlim = [0, end-start]
+            for i, img in enumerate(self.trak_video):
+                fig, ax = plt.subplots(ncols=1, nrows=2, sharex=True)
+                ax[0].scatter(range(i+1), spd_x[:i+1], c='r')
+                ax[0].set_title('x axis speed (m/s)', fontsize=24, fontweight='bold')
+                ax[0].set_xlim(xlim)
+                ax[0].set_ylim(xspdlim)
+                ax[0].tick_params(axis='both', which='major', labelsize=20)
+                
+                ax[1].scatter(range(i+1), spd_y[:i+1], c='r')
+                ax[1].set_title('y axis speed (m/s)', fontsize=24, fontweight='bold')
+                ax[1].set_xlim(xlim)
+                ax[1].set_ylim(yspdlim)
+                ax[1].tick_params(axis='both', which='major', labelsize=20)
+                
+                for axis in ['top','bottom','left','right']:
+                    ax[0].spines[axis].set_linewidth(1)
+                    ax[1].spines[axis].set_linewidth(1)
+                plt.tight_layout()    
+                fig.savefig('spd_chart.png', transparent=True)
+                plt.close(fig)
+                chart = cv2.imread('spd_chart.png', cv2.IMREAD_UNCHANGED)
+                chart = cv2.resize(chart, (ch_w, ch_h), interpolation = cv2.INTER_AREA)
+                roi = img[:ch_h,-ch_w:, :]
+                mask = np.dstack([chart[...,-1]>128]*3)
+                roi = np.where(mask, chart[...,:-1], roi)
+                img[:ch_h,-ch_w:, :] = roi
+                cv2.imshow('frame',img)
+                cv2.waitKey(100) & 0xff
+            cv2.destroyAllWindows()
+            plt.ion()
         filename = self.video_file[:-4]+"_track_frames_{0}_to_{1}.csv".format(start,end)
         Tk().withdraw()
         save_filename = asksaveasfilename(initialfile=filename,
@@ -255,7 +292,7 @@ class Video_utill:
         motion.to_csv(save_filename)
         return
     
-    def save_tracking_video(self, fps=None):
+    def save_tracking_video(self, fps=10):
         """
         Opens a tkinter save file dialog to get save file name
         and save a video under the given name
@@ -443,10 +480,10 @@ ap.add_argument("-v", "--path", default="", help="Path to video file")
 if __name__=='__main__':
     args = ap.parse_args()
     if args.mode=="auto":
-        v = Video_utill(args.video_file)
+        v = Video_util(args.video_file)
         v.set_roi()
         v.set_pxl_size()
-        v.track()
-        v.save_tracking_video(fps=30)
+        v.track(draw_speeds=True)
+        v.save_tracking_video(fps=5)
     else:
         g = Gui(args)
