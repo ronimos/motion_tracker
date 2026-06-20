@@ -406,19 +406,21 @@ class VideoUtil:
                 a, b = new.ravel()
                 c, d = old.ravel()
 
-                # Store raw displacement in real-world units (meters)
+                # Store raw displacement in real-world units (meters).
+                # Y is negated so that up is positive (image rows increase
+                # downward, so screen-down is d->b positive without the flip).
                 frame_motion_data[f'p{i}_x'] = (a - c) * self.pix_width
-                frame_motion_data[f'p{i}_y'] = (b - d) * self.pix_height
+                frame_motion_data[f'p{i}_y'] = (d - b) * self.pix_height
                 dxdt.append((a - c) * self.pix_width * self.fps)
-                dydt.append((b - d) * self.pix_height * self.fps)
+                dydt.append((d - b) * self.pix_height * self.fps)
 
                 # Subtract camera motion: where would a static point at (c, d)
                 # land under the estimated camera transform? The residual is the
-                # object's true motion relative to the scene.
+                # object's true motion relative to the scene. Y negated (up positive).
                 if cam_M is not None:
                     ex, ey = self._apply_affine(cam_M, c, d)
                     corr_dx = (a - ex) * self.pix_width
-                    corr_dy = (b - ey) * self.pix_height
+                    corr_dy = (ey - b) * self.pix_height
                     frame_motion_data[f'p{i}_x_corr'] = corr_dx
                     frame_motion_data[f'p{i}_y_corr'] = corr_dy
                     cdxdt.append(corr_dx * self.fps)
