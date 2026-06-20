@@ -1,489 +1,745 @@
 # -*- coding: utf-8 -*-
 """
-Created on Mon Apr  9 16:10:16 2018
+Video Motion Tracker
+====================
+
+This script provides a utility for tracking the motion of objects in a video file.
+It uses OpenCV's feature detection and optical flow algorithms. The user can
+interactively select a region of interest (ROI), calibrate pixel-to-distance
+measurements, and track feature points within that ROI across frames.
+
+The application can be run in two modes:
+1.  GUI Mode (default): A simple Tkinter interface allows the user to perform
+    actions step-by-step.
+2.  Auto Mode: A command-line driven mode to run a pre-defined sequence of
+    operations (load, set ROI, set pixel size, track, save).
+
+Dependencies:
+- numpy
+- opencv-python
+- tkinter
+- pandas
+- tqdm
+- matplotlib
 
 @author: Ron Simenhois
 """
 
 import numpy as np
 import cv2
-from tkinter import Tk, simpledialog, Button, messagebox
-from tkinter.filedialog import askopenfilename, asksaveasfilename
 import pandas as pd
-from tqdm import tqdm_gui, tqdm
+from tkinter import Tk, Button, simpledialog, messagebox
+from tkinter.filedialog import askopenfilename, asksaveasfilename
+from tqdm import tqdm, tqdm_gui
 import matplotlib.pyplot as plt
 import warnings
 import argparse
+import os
 
+# Suppress minor warnings, e.g., from matplotlib or other libraries.
 warnings.filterwarnings("ignore")
 
-'''
-Video_utill Class: measure motion of items throughout a video
-'''
 
-class Video_util:
+class VideoUtil:
+    """
+    A utility class to handle video processing for motion tracking.
+
+    This class encapsulates all the functionalities related to loading a video,
+    selecting a region of interest (ROI), calibrating scale, tracking features
+    using Lucas-Kanade optical flow, and saving the results.
+    """
     def __init__(self, video_file=''):
-            
-        if video_file=='':
+        """
+        Initializes the VideoUtil object.
+
+        Args:
+            video_file (str, optional): The path to the video file.
+                                        If empty, a file dialog will open.
+        """
+        if not video_file:
+            # Hide the root Tkinter window and open a file dialog.
             Tk().withdraw()
-            self.video_file = askopenfilename()
-            self.cap = cv2.VideoCapture(self.video_file)
+            self.video_file = askopenfilename(title="Select a video file")
+            if not self.video_file:
+                raise FileNotFoundError("No video file selected.")
         else:
             self.video_file = video_file
-            self.cap = cv2.VideoCapture(self.video_file)
-            # params for ShiTomasi corner detection
-        self.feature_params = dict( maxCorners = 20,
-                                   qualityLevel = .3,
-                                   minDistance = 15,
-                                   blockSize = 7 )
 
-        # Parameters for lucas kanade optical flow
-        self.lk_params = dict( winSize  = (15,15),
-                              maxLevel = 2,
-                              criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
-        self.pxl_size = -1
+        self.cap = cv2.VideoCapture(self.video_file)
+        if not self.cap.isOpened():
+            raise IOError(f"Cannot open video file: {self.video_file}")
+
+        # --- Parameters for ShiTomasi corner detection ---
+        self.feature_params = dict(maxCorners=20,
+                                   qualityLevel=0.3,
+                                   minDistance=15,
+                                   blockSize=7)
+
+        # --- Parameters for Lucas-Kanade optical flow ---
+        self.lk_params = dict(winSize=(15, 15),
+                              maxLevel=2,
+                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+
+        # --- Instance variables ---
+        self.pix_height = 1.0  # meters per pixel (vertical)
+        self.pix_width = 1.0   # meters per pixel (horizontal)
+        self.trak_video = []   # Buffer for tracked video frames
+        self.frame_num = 0     # Current frame number for UI interactions
+        self.drawing = False   # Flag for mouse drawing events
+        self.ix, self.iy = -1, -1 # Initial drawing coordinates
+
+        # Pre-load video frames into memory.
         self.load_video()
-        self.mask = self.video_buffer[0].copy()
-        self.pix_heigth = 1
-        self.pix_width = 1
-        self.trak_video = []
-        self.frame_num = 0
-        
+        # Initialize a default mask covering the entire frame.
+        self.mask = np.ones_like(self.video_buffer[0], dtype=np.uint8) * 255
+
+
     def load_video(self):
-        
+        """
+        Loads the entire video file into a NumPy array in memory.
+
+        This method reads all frames from the video source and stores them in
+        `self.video_buffer`. This is memory-intensive but allows for fast,
+        non-linear access to frames for interactive tasks like trimming.
+        """
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.length = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
+
         self.video_buffer = np.zeros((self.length, self.height, self.width, 3), dtype='uint8')
-        for i in tqdm_gui(range(self.length), leave=True):
+        print("Loading video into memory...")
+        for i in tqdm(range(self.length), desc="Loading frames"):
             ret, frame = self.cap.read()
             if not ret:
+                # If reading fails, truncate the buffer to the frames read.
+                self.length = i
+                self.video_buffer = self.video_buffer[:i]
                 break
-            self.video_buffer[i]=frame.copy()
-        plt.close()
+            self.video_buffer[i] = frame.copy()
+
         self.cap.release()
         self.cap = None
-        return
+        print("Video loaded successfully.")
 
-    def on_mouse(self,event, x, y, flag, param):
 
+    def on_mouse(self, event, x, y, flags, param):
+        """
+        OpenCV mouse callback function to draw a rectangle.
+
+        Used for selecting ROI and calibration areas.
+        """
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.drawing = True
+            self.ix, self.iy = x, y
+
+        elif event == cv2.EVENT_MOUSEMOVE:
             if self.drawing:
+                # Create a copy to draw the rectangle dynamically
                 self.img_cp = self.img.copy()
-            if event == cv2.EVENT_LBUTTONDOWN:
-                self.drawing = True
-                self.ix, self.iy = x, y
-            elif event == cv2.EVENT_MOUSEMOVE:
-                if self.drawing:
-                    cv2.rectangle(self.img_cp, (self.ix, self.iy), (x, y), (0, 255, 0), 2)
-            elif event == cv2.EVENT_LBUTTONUP:
-                if self.drawing:
-                    self.drawing = False
-                    cv2.rectangle(self.img_cp, (self.ix, self.iy), (x, y), (0, 255, 0), 2)
-                    self.ul_cr = (max(min(x, self.ix), 0), max(min(y, self.iy), 0))
-                    self.lr_cr = (min(max(x, self.ix), self.img_cp.shape[1]), min(max(y, self.iy), self.img_cp.shape[0]))
-            return
-      
-    
+                cv2.rectangle(self.img_cp, (self.ix, self.iy), (x, y), (0, 255, 0), 2)
+
+        elif event == cv2.EVENT_LBUTTONUP:
+            if self.drawing:
+                self.drawing = False
+                cv2.rectangle(self.img_cp, (self.ix, self.iy), (x, y), (0, 255, 0), 2)
+                # Define upper-left and lower-right corners
+                self.ul_cr = (min(x, self.ix), min(y, self.iy))
+                self.lr_cr = (max(x, self.ix), max(y, self.iy))
+
+
     def set_roi(self):
+        """
+        Opens an interactive window to define the Region of Interest (ROI).
+
+        The user can draw a rectangle on a frame to specify the area where
+        features should be tracked. A trackbar allows scrubbing through frames.
+        """
+        self.drawing = False
+        zoom = 1
+        window_name = 'Draw rectangle around track area | - to zoom out | Esc to save'
+        cv2.namedWindow(window_name)
+        cv2.setMouseCallback(window_name, self.on_mouse)
+
+        # Trackbar callback to change the displayed frame
         def _change_frame(trackbar_val):
             self.frame_num = trackbar_val
             self.img = self.video_buffer[self.frame_num].copy()
             self.img_cp = self.img.copy()
-            
-        self.mask = np.zeros_like(self.video_buffer[0])
-        zoom = 1
-        self.drawing = False
-        window_name = 'Draw a rectangle around the area you want to track, Click "-" to resize, Esc to exit'
-        cv2.namedWindow(window_name)
-        cv2.setMouseCallback(window_name, self.on_mouse)
-        cv2.createTrackbar("Frame #: ", window_name, 0, self.length, _change_frame)
-        self.frame_num=0        
+
+        cv2.createTrackbar("Frame #: ", window_name, 0, self.length - 1, _change_frame)
+
+        # Initialize with the first frame
+        self.frame_num = 0
         self.img = self.video_buffer[self.frame_num].copy()
         self.img_cp = self.img.copy()
         self.ul_cr = (0, 0)
         self.lr_cr = (self.img.shape[1], self.img.shape[0])
+
         while True:
             cv2.imshow(window_name, self.img_cp)
             k = cv2.waitKey(20) & 0xFF
-            if k == 27:
+            if k == 27:  # ESC key
                 break
-            if k == ord('-'):
+            if k == ord('-'): # Zoom out
                 self.img = cv2.resize(self.img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
                 self.img_cp = self.img.copy()
-                self.ul_cr = (0, 0)
-                self.lr_cr = (self.img.shape[1], self.img.shape[0])
-                zoom *= 2
+                zoom *= 2 # Adjust zoom factor for coordinate mapping
+
         cv2.destroyAllWindows()
-        self.mask[self.ul_cr[1]*zoom:self.lr_cr[1]*zoom, self.ul_cr[0]*zoom:self.lr_cr[0]*zoom, :] = self.video_buffer[0,self.ul_cr[1]*zoom:self.lr_cr[1]*zoom, self.ul_cr[0]*zoom:self.lr_cr[0]*zoom, :]
-        return
-    
-    
+        # Create a new mask based on the user-drawn rectangle
+        self.mask = np.zeros_like(self.video_buffer[0], dtype=np.uint8)
+        # Apply zoom factor to map coordinates back to the original frame size
+        top_y = self.ul_cr[1] * zoom
+        bot_y = self.lr_cr[1] * zoom
+        left_x = self.ul_cr[0] * zoom
+        right_x = self.lr_cr[0] * zoom
+        self.mask[top_y:bot_y, left_x:right_x] = 255
+
+
     def set_pxl_size(self):
-        
+        """
+        Calibrates the pixel-to-meter ratio.
+
+        The user draws a rectangle over an object of known real-world size.
+        Dialog boxes prompt for the height and width in meters to calculate
+        the conversion factors.
+        """
         zoom = 1
         self.drawing = False
-        window_name = 'Draw a rectangle with a known height (in m), Click "-" to resize, Esc to exit'
+        window_name = 'Draw a rectangle with a known size (in meters) | Esc to save'
         cv2.namedWindow(window_name)
         cv2.setMouseCallback(window_name, self.on_mouse)
+
+        # Initialize with first frame and default rectangle
         self.img = self.video_buffer[0].copy()
         self.img_cp = self.img.copy()
         self.ul_cr = (0, 0)
         self.lr_cr = (self.img.shape[1], self.img.shape[0])
+
         while True:
             cv2.imshow(window_name, self.img_cp)
             k = cv2.waitKey(20) & 0xFF
-            if k == 27:
+            if k == 27:  # ESC key
                 break
-            if k == ord('-'):
+            if k == ord('-'): # Zoom out
                 self.img = cv2.resize(self.img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
                 self.img_cp = self.img.copy()
-                self.ul_cr = (0, 0)
-                self.lr_cr = (self.img.shape[1], self.img.shape[0])
                 zoom *= 2
+
         cv2.destroyAllWindows()
-        heigth = np.abs(self.ul_cr[1] - self.lr_cr[1]) * zoom
-        width = np.abs(self.ul_cr[0] - self.lr_cr[0]) * zoom
-        Tk().withdraw()
-        
-        rect_height = simpledialog.askstring(title = "Get pixel size", 
-                                             prompt = "Entire retcangle heigth in m", 
-                                             initialvalue="Click cancel if unknown")
+        # Calculate the pixel dimensions of the drawn rectangle
+        height_px = abs(self.ul_cr[1] - self.lr_cr[1]) * zoom
+        width_px = abs(self.ul_cr[0] - self.lr_cr[0]) * zoom
+
+        Tk().withdraw() # Hide root Tkinter window
+
+        # --- Get real-world height ---
+        rect_height_m_str = simpledialog.askstring(
+            title="Pixel Size Calibration",
+            prompt="Enter rectangle height in meters (or leave blank if unknown):"
+        )
         try:
-            rect_height = float(rect_height)
-            self.pix_heigth = rect_height/heigth
-        except (TypeError, ValueError):
-            rect_height="cancel"
-            
-        Tk().withdraw()
-        rect_width = simpledialog.askstring(title = "Get pixel size", 
-                                             prompt = "Entire retcangle width in m", 
-                                             initialvalue="Click cancel if unknown")
-        
+            self.pix_height = float(rect_height_m_str) / height_px
+        except (ValueError, TypeError, ZeroDivisionError):
+            self.pix_height = None
+
+        # --- Get real-world width ---
+        rect_width_m_str = simpledialog.askstring(
+            title="Pixel Size Calibration",
+            prompt="Enter rectangle width in meters (or leave blank if unknown):"
+        )
         try:
-            rect_width = float(rect_width)
-            self.pix_width = rect_width/width
-        except (TypeError, ValueError):
-            rect_height="cancel"
-            
-        if rect_height=="cancel":
-            self.pix_heigth = self.pix_width
-        elif rect_width=="cancel":
-            self.width = self.pix_heigth
-        return
-            
-        
-    def track(self, draw_speeds=True):
+            self.pix_width = float(rect_width_m_str) / width_px
+        except (ValueError, TypeError, ZeroDivisionError):
+            self.pix_width = None
+
+        # --- Handle cases where one dimension is unknown (assume square pixels) ---
+        if self.pix_height is None and self.pix_width is None:
+            print("Warning: No calibration data entered. Using 1.0 for pixel ratios.")
+            self.pix_height, self.pix_width = 1.0, 1.0
+        elif self.pix_height is None:
+            self.pix_height = self.pix_width
+        elif self.pix_width is None:
+            self.pix_width = self.pix_height
+
+        print(f"Calibration set: 1 pixel = {self.pix_width:.4f}m (width), {self.pix_height:.4f}m (height)")
+
+
+    @staticmethod
+    def _apply_affine(M, x, y):
+        """Maps point (x, y) through a 2x3 affine transform M."""
+        ex = M[0, 0] * x + M[0, 1] * y + M[0, 2]
+        ey = M[1, 0] * x + M[1, 1] * y + M[1, 2]
+        return ex, ey
+
+    def _camera_transform(self, prev_pts, next_pts):
+        """
+        Estimates the camera (background) motion between two frames.
+
+        Fits a partial-affine transform (translation + rotation + uniform scale)
+        from the background feature correspondences using RANSAC. Falls back to a
+        pure median translation when too few points are available, and to the
+        identity transform when there are none.
+
+        Args:
+            prev_pts (np.ndarray): Background points in the previous frame, shape (N, 2).
+            next_pts (np.ndarray): The same points in the current frame, shape (N, 2).
+
+        Returns:
+            tuple[np.ndarray, int, str]: the 2x3 transform mapping prev->next, the
+            number of points that informed it, and the method used
+            ('affine', 'translation', or 'none').
+        """
+        n = 0 if prev_pts is None else len(prev_pts)
+        if n >= 3:
+            M, inliers = cv2.estimateAffinePartial2D(
+                prev_pts, next_pts, method=cv2.RANSAC, ransacReprojThreshold=3)
+            if M is not None:
+                n_used = int(inliers.sum()) if inliers is not None else n
+                return M, n_used, 'affine'
+        if n >= 1:
+            # Fallback: median translation handles pan/tilt but not rotation/zoom.
+            d = (next_pts - prev_pts).reshape(-1, 2)
+            tx, ty = np.median(d[:, 0]), np.median(d[:, 1])
+            return np.array([[1, 0, tx], [0, 1, ty]], dtype=np.float64), n, 'translation'
+        # No background information: identity (no correction this frame).
+        return np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float64), 0, 'none'
+
+    def track(self, draw_speeds=True, stabilize=True):
+        """
+        Performs the motion tracking using Lucas-Kanade optical flow.
+
+        Detects features in the first frame within the ROI and tracks their
+        movement in subsequent frames. It calculates the displacement and speed,
+        saves the data to a pandas DataFrame, and generates a video with
+        tracking overlays.
+
+        When ``stabilize`` is True, features are also tracked in the background
+        (outside the ROI) to estimate the camera's own motion, which is then
+        subtracted from the ROI motion. This removes apparent motion caused by a
+        panning/handheld camera, leaving the object's motion relative to the scene.
+
+        Args:
+            draw_speeds (bool): If True, generates and overlays a speed plot
+                                on the output video.
+            stabilize (bool): If True, compensate for camera motion using
+                              background features.
+        """
         self.trak_video = []
-        if messagebox.askyesno("", "Do you want to set frames to track?"):
-            start, end = self.trim_video(trim=False)
+        if messagebox.askyesno("Frame Range", "Do you want to track a specific range of frames?"):
+            start_frame, end_frame = self.trim_video(trim=False)
         else:
-            start = 0
-            end = self.length
-        # Create DataFrame to store motion between frames
+            start_frame, end_frame = 0, self.length
+
+        # --- Initialization for Tracking ---
+        color = np.random.randint(0, 255, (100, 3))
+        old_frame = self.video_buffer[start_frame]
+        old_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
+
+        # Use the grayscale version of the ROI mask for feature detection
+        mask_gray = cv2.cvtColor(self.mask, cv2.COLOR_BGR2GRAY)
+        p0 = cv2.goodFeaturesToTrack(old_gray, mask=mask_gray, **self.feature_params)
+
+        if p0 is None:
+            messagebox.showerror("Tracking Error", "No features found in the selected ROI.")
+            return
+
+        # --- Background features for camera-motion compensation ---
+        bg_mask = None
+        bg_p0 = None
+        bg_params = dict(self.feature_params, maxCorners=200)
+        if stabilize:
+            # Exclude the ROI (dilated, to avoid edge bleed) so the tracked
+            # object cannot contaminate the camera-motion estimate.
+            roi_dilated = cv2.dilate(mask_gray, np.ones((15, 15), np.uint8))
+            bg_mask = cv2.bitwise_not(roi_dilated)
+            bg_p0 = cv2.goodFeaturesToTrack(old_gray, mask=bg_mask, **bg_params)
+            if bg_p0 is None:
+                print("Warning: no background features found; stabilization disabled.")
+                stabilize = False
+
+        # Create DataFrame to store motion data (raw, plus corrected when stabilizing)
         cols = []
         for i in range(self.feature_params['maxCorners']):
-            cols.append('p' + str(i) + '_x')
-            cols.append('p' + str(i) + '_y')
-        motion = pd.DataFrame(columns=cols)
-        color = np.random.randint(0,255,(100,3))
-        #self.cap = cv2.VideoCapture(self.video_file)
-        # Take first frame and find corners in it
-        #ret, old_frame = self.cap.read()
-        old_frame = self.video_buffer[start]
-        old_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
-        mask_gray = cv2.cvtColor(self.mask, cv2.COLOR_BGR2GRAY)
-        p0 = cv2.goodFeaturesToTrack(old_gray, mask = mask_gray, **self.feature_params)
-        height, width = old_frame.shape[:2] 
-        ch_h, ch_w = int(height/2), int(width/5)
-        text_x = int(old_frame.shape[1]/100)
-        text_y1 = int(0.1 * height)
-        text_y2 = int(0.13 * height)
-        # Create a mask image for drawing purposes
-        mask = np.zeros_like(old_frame)   
-        first_frame = True
-        spd_x, spd_y = [],[]
-        for idx in tqdm(range(start, end)):
+            cols += [f'p{i}_x', f'p{i}_y']
+            if stabilize:
+                cols += [f'p{i}_x_corr', f'p{i}_y_corr']
+        if stabilize:
+            cols += ['bg_points', 'cam_dx', 'cam_dy']
+        motion_df = pd.DataFrame(columns=cols)
+
+        overlay_mask = np.zeros_like(old_frame) # Mask for drawing tracking lines
+        speeds_x, speeds_y = [], []
+        
+        print("Tracking motion...")
+        for idx in tqdm(range(start_frame, end_frame), desc="Tracking frames"):
             frame = self.video_buffer[idx]
             frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # calculate optical flow
+
+            # --- Calculate Optical Flow ---
             p1, st, err = cv2.calcOpticalFlowPyrLK(old_gray, frame_gray, p0, None, **self.lk_params)
-        
-            # Select good points
-            good_new = p1[st==1]
-            good_old = p0[st==1]
-            
-            # save changes in 
-            d_motion = {}
-            dxdt,dydt = [],[]
-            for i,(new,old) in enumerate(zip(good_new,good_old)):
-                a,b = new.ravel()
-                c,d = old.ravel()
-                d_motion['p'+str(i)+'_x']=(a-c)*self.pix_width
-                d_motion['p'+str(i)+'_y']=(b-d)*self.pix_heigth
-                if first_frame:
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    mask = cv2.putText(mask, str(i), (a,b), font, 1, color[i].tolist(), 1, lineType = cv2.LINE_AA)
-                mask = cv2.line(mask, (a,b),(c,d), color[i].tolist(), 2)
-                frame = cv2.circle(frame,(a,b),5,color[i].tolist(),-1)
-                dxdt.append((a-c)*self.pix_width*self.fps)
-                dydt.append((b-d)*self.pix_heigth*self.fps)
-                
-            motion = motion.append(d_motion, ignore_index=True)
-            img = cv2.add(frame,mask)
-            dxdt = 0 if round(np.median(dxdt), 2)==0 else round(np.median(dxdt), 2)
-            dydt = 0 if round(np.median(dydt), 2)==0 else round(np.median(dydt), 2)
-            spd_x.append(abs(dxdt))
-            spd_y.append(abs(dydt))
-            speed_x = "dx/dt = {0} m/s".format(dxdt)
-            speed_y = "dy/dt = {0} m/s".format(dydt)
-            img = cv2.putText(img, speed_x, (text_x, text_y1), font, 1, (0, 0, 255), 1, lineType = cv2.LINE_AA)
-            img = cv2.putText(img, speed_y, (text_x, text_y2), font, 1, (0, 0, 255), 1, lineType = cv2.LINE_AA)
+
+            # --- Select and process good points ---
+            if p1 is not None:
+                good_new = p1[st == 1]
+                good_old = p0[st == 1]
+            else:
+                good_new, good_old = [], []
+
+            # --- Estimate camera motion from background features ---
+            cam_M, n_bg, cam_method = None, 0, 'none'
+            if stabilize and bg_p0 is not None and len(bg_p0) > 0:
+                bg_p1, bg_st, _ = cv2.calcOpticalFlowPyrLK(
+                    old_gray, frame_gray, bg_p0, None, **self.lk_params)
+                if bg_p1 is not None:
+                    bg_good_new = bg_p1[bg_st == 1]
+                    bg_good_old = bg_p0[bg_st == 1]
+                    cam_M, n_bg, cam_method = self._camera_transform(bg_good_old, bg_good_new)
+                    bg_p0 = bg_good_new.reshape(-1, 1, 2)
+
+            frame_motion_data = {}
+            dxdt, dydt = [], []          # raw speeds (m/s)
+            cdxdt, cdydt = [], []        # camera-corrected speeds (m/s)
+
+            for i, (new, old) in enumerate(zip(good_new, good_old)):
+                a, b = new.ravel()
+                c, d = old.ravel()
+
+                # Store raw displacement in real-world units (meters)
+                frame_motion_data[f'p{i}_x'] = (a - c) * self.pix_width
+                frame_motion_data[f'p{i}_y'] = (b - d) * self.pix_height
+                dxdt.append((a - c) * self.pix_width * self.fps)
+                dydt.append((b - d) * self.pix_height * self.fps)
+
+                # Subtract camera motion: where would a static point at (c, d)
+                # land under the estimated camera transform? The residual is the
+                # object's true motion relative to the scene.
+                if cam_M is not None:
+                    ex, ey = self._apply_affine(cam_M, c, d)
+                    corr_dx = (a - ex) * self.pix_width
+                    corr_dy = (b - ey) * self.pix_height
+                    frame_motion_data[f'p{i}_x_corr'] = corr_dx
+                    frame_motion_data[f'p{i}_y_corr'] = corr_dy
+                    cdxdt.append(corr_dx * self.fps)
+                    cdydt.append(corr_dy * self.fps)
+
+                # Draw tracking lines and points
+                overlay_mask = cv2.line(overlay_mask, (int(a), int(b)), (int(c), int(d)), color[i].tolist(), 2)
+                frame = cv2.circle(frame, (int(a), int(b)), 5, color[i].tolist(), -1)
+
+            if cam_M is not None:
+                # Diagnostic: median background displacement in meters this frame.
+                frame_motion_data['bg_points'] = n_bg
+                frame_motion_data['cam_dx'] = float(np.median(cdxdt) - np.median(dxdt)) / self.fps if dxdt else 0.0
+                frame_motion_data['cam_dy'] = float(np.median(cdydt) - np.median(dydt)) / self.fps if dydt else 0.0
+
+            motion_df = pd.concat([motion_df, pd.DataFrame([frame_motion_data])], ignore_index=True)
+            img = cv2.add(frame, overlay_mask)
+
+            # --- Calculate and Display Median Speed ---
+            # When stabilizing, report the corrected speed; otherwise the raw speed.
+            use_corr = cam_M is not None and cdxdt
+            median_dxdt = np.median(cdxdt if use_corr else dxdt) if (cdxdt or dxdt) else 0
+            median_dydt = np.median(cdydt if use_corr else dydt) if (cdydt or dydt) else 0
+            speeds_x.append(abs(median_dxdt))
+            speeds_y.append(abs(median_dydt))
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            text_y1 = int(0.10 * self.height)
+            text_y2 = int(0.15 * self.height)
+            cv2.putText(img, f"dx/dt = {median_dxdt:.2f} m/s", (10, text_y1), font, 1, (0, 0, 255), 2)
+            cv2.putText(img, f"dy/dt = {median_dydt:.2f} m/s", (10, text_y2), font, 1, (0, 0, 255), 2)
+            if stabilize:
+                text_y3 = int(0.20 * self.height)
+                conf_color = (0, 200, 0) if n_bg >= 10 else (0, 165, 255)
+                cv2.putText(img, f"bg pts: {n_bg} ({cam_method})", (10, text_y3),
+                            font, 0.7, conf_color, 2)
+
             self.trak_video.append(img)
-        
-            # Now update the previous frame and previous points
+
+            # --- Update for next iteration ---
             old_gray = frame_gray.copy()
-            p0 = good_new.reshape(-1,1,2)
-            first_frame=False
-        if draw_speeds:
-            plt.ioff()
-            xspdlim = [0, round(max(spd_x),1) + 0.1]    
-            yspdlim = [0, round(max(spd_y),1) + 0.1]
-            xlim = [0, end-start]
-            for i, img in enumerate(self.trak_video):
-                fig, ax = plt.subplots(ncols=1, nrows=2, sharex=True)
-                ax[0].scatter(range(i+1), spd_x[:i+1], c='r')
-                ax[0].set_title('x axis speed (m/s)', fontsize=24, fontweight='bold')
-                ax[0].set_xlim(xlim)
-                ax[0].set_ylim(xspdlim)
-                ax[0].tick_params(axis='both', which='major', labelsize=20)
-                
-                ax[1].scatter(range(i+1), spd_y[:i+1], c='r')
-                ax[1].set_title('y axis speed (m/s)', fontsize=24, fontweight='bold')
-                ax[1].set_xlim(xlim)
-                ax[1].set_ylim(yspdlim)
-                ax[1].tick_params(axis='both', which='major', labelsize=20)
-                
-                for axis in ['top','bottom','left','right']:
-                    ax[0].spines[axis].set_linewidth(1)
-                    ax[1].spines[axis].set_linewidth(1)
-                plt.tight_layout()    
-                fig.savefig('spd_chart.png', transparent=True)
-                plt.close(fig)
-                chart = cv2.imread('spd_chart.png', cv2.IMREAD_UNCHANGED)
-                chart = cv2.resize(chart, (ch_w, ch_h), interpolation = cv2.INTER_AREA)
-                roi = img[:ch_h,-ch_w:, :]
-                mask = np.dstack([chart[...,-1]>128]*3)
-                roi = np.where(mask, chart[...,:-1], roi)
-                img[:ch_h,-ch_w:, :] = roi
-                cv2.imshow('frame',img)
-                cv2.waitKey(100) & 0xff
-            cv2.destroyAllWindows()
-            plt.ion()
-        filename = self.video_file[:-4]+"_track_frames_{0}_to_{1}.csv".format(start,end)
+            p0 = good_new.reshape(-1, 1, 2)
+
+            # Re-detect background features when too many have been lost.
+            if stabilize and (bg_p0 is None or len(bg_p0) < 10):
+                bg_p0 = cv2.goodFeaturesToTrack(frame_gray, mask=bg_mask, **bg_params)
+
+        # --- Optional: Overlay Speed Plots ---
+        if draw_speeds and self.trak_video:
+            self.overlay_speed_plots(speeds_x, speeds_y, start_frame, end_frame)
+        
+        cv2.destroyAllWindows()
+        print("Tracking complete.")
+
+        # --- Save Motion Data to CSV ---
+        initial_filename = f"{os.path.splitext(self.video_file)[0]}_track_frames_{start_frame}_to_{end_frame}.csv"
         Tk().withdraw()
-        save_filename = asksaveasfilename(initialfile=filename,
-                                          defaultextension=".csv", 
-                                          filetypes=[("coma seperate, salues", "csv"), 
-                                                     ("all files", ".*")],
-                                          title="Save motion records")
-        if save_filename =="":
-            return
-        motion.to_csv(save_filename)
-        return
-    
+        save_filename = asksaveasfilename(initialfile=initial_filename,
+                                          defaultextension=".csv",
+                                          filetypes=[("CSV (Comma-separated)", "*.csv"), ("All Files", "*.*")],
+                                          title="Save Motion Data")
+        if save_filename:
+            motion_df.to_csv(save_filename, index=False)
+            print(f"Motion data saved to {save_filename}")
+
+
+    def overlay_speed_plots(self, speeds_x, speeds_y, start, end):
+        """Helper function to generate and overlay speed plots on video frames."""
+        print("Generating speed plots for video overlay...")
+        plt.ioff() # Turn off interactive plotting
+        
+        # Define plot dimensions and limits
+        ch_h, ch_w = int(self.height / 2), int(self.width / 5)
+        xlim = [0, end - start]
+        xspdlim = [0, max(0.1, max(speeds_x) * 1.1)]
+        yspdlim = [0, max(0.1, max(speeds_y) * 1.1)]
+
+        temp_chart_path = 'spd_chart.png'
+
+        for i, img in enumerate(tqdm(self.trak_video, desc="Overlaying plots")):
+            fig, ax = plt.subplots(ncols=1, nrows=2, sharex=True, figsize=(ch_w/100, ch_h/100), dpi=100)
+            
+            ax[0].plot(range(i + 1), speeds_x[:i + 1], 'r.-')
+            ax[0].set_title('X-axis speed (m/s)', fontsize=10)
+            ax[0].set_xlim(xlim)
+            ax[0].set_ylim(xspdlim)
+            
+            ax[1].plot(range(i + 1), speeds_y[:i + 1], 'r.-')
+            ax[1].set_title('Y-axis speed (m/s)', fontsize=10)
+            ax[1].set_xlabel('Frame #', fontsize=8)
+            ax[1].set_xlim(xlim)
+            ax[1].set_ylim(yspdlim)
+            
+            plt.tight_layout()
+            fig.savefig(temp_chart_path, transparent=True)
+            plt.close(fig)
+
+            # Load chart and overlay onto the video frame
+            chart = cv2.imread(temp_chart_path, cv2.IMREAD_UNCHANGED)
+            chart_resized = cv2.resize(chart, (ch_w, ch_h), interpolation=cv2.INTER_AREA)
+            
+            roi = img[:ch_h, -ch_w:]
+            alpha_mask = chart_resized[:, :, 3] / 255.0
+            alpha_mask_3d = np.stack([alpha_mask] * 3, axis=-1)
+            
+            chart_rgb = chart_resized[:, :, :3]
+            blended_roi = (chart_rgb * alpha_mask_3d + roi * (1 - alpha_mask_3d)).astype(np.uint8)
+            img[:ch_h, -ch_w:] = blended_roi
+            self.trak_video[i] = img # Update the frame in the buffer
+
+            cv2.imshow('Tracking with Speed Plot', img)
+            cv2.waitKey(10) # Small delay to show progress
+            
+        cv2.destroyAllWindows()
+        if os.path.exists(temp_chart_path):
+            os.remove(temp_chart_path)
+        plt.ion() # Turn interactive plotting back on
+
+
     def save_tracking_video(self, fps=10):
         """
-        Opens a tkinter save file dialog to get save file name
-        and save a video under the given name
-        ---------------------------------------------------------
-        Params:
-            self
-            video (np.array) - numpy array that contains the video
-        return:
-            save_file: (str) saved video file location and name
-        """
-        
-        video=self.trak_video
-        filename = self.video_file[:-4]+"_track_.mp4"
-        Tk().withdraw()
-        save_file = asksaveasfilename(initialfile=filename,
-                                      defaultextension=".mp4",
-                                      filetypes=[("video file", "mp4"), 
-                                                 ("all files", ".*")],
-                                      title="Save motion video")
-        if save_file==None:
-            return
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(filename=save_file, fourcc=fourcc, fps=fps, 
-                              frameSize=(self.width, self.height),isColor=True)
-        for frame in video:
-            out.write(frame)
-        out.release()
-        print('Video file is saved')
-        return save_file
-    
-    def trim_video(self, trim):
-        def _move(frame_n):
-            self.frame_num=frame_n
-            
-        win_width, win_heigth = self.video_buffer[0].shape[:2]
-        win_width, win_heigth = int(win_width/2), int(win_heigth/2)
-        win_name = "Video trim. \
-                    Click 's' for start frame, \
-                    'e' for end frame, \
-                    'f' for forward, \
-                    'b' for backward and Esc to save and close"
-        track_name = "Frame #:"
-        start = 0
-        end = self.length
-        cv2.namedWindow(win_name)
-        cv2.resizeWindow(win_name, win_width, win_heigth)
-        cv2.createTrackbar(track_name, win_name,0,end, _move)
-        self.frame_num = 0
-        cv2.setTrackbarPos(track_name, win_name, self.frame_num)
-        
-        while True:
-            frame = self.video_buffer[self.frame_num].copy()
-            frame = cv2.resize(frame, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_CUBIC)
-            cv2.imshow(win_name, frame)
-            k = cv2.waitKey(30) & 0xFF
-            if k==ord("s"):
-                start = self.frame_num
-            if k==ord("e"):
-                end = self.frame_num
-            if k==ord("f"):
-                self.frame_num = min(self.frame_num+1, self.length-1)
-            if k==ord("b"):
-                self.frame_num = max(0, self.frame_num-1)
-            if k==27:
-                break
-            cv2.setTrackbarPos(track_name, win_name, self.frame_num)
-        if trim:
-            self.video_buffer = self.video_buffer[start:end,...]
-            self.length = self.video_buffer.shape[0]
-        cv2.destroyAllWindows()
-        return start, end
-        
-        
-    def play_video(self):
-        def _move(frame_n):
-            self.frame_num=frame_n
+        Saves the tracked video (with overlays) to a file.
 
-        win_width, win_heigth = int(self.width/2), int(self.height/2)
-        win_name = "Play video: {0}". format(self.video_file)
-        track_name = "Frame #:"
+        Args:
+            fps (int): The frames per second for the output video.
+        """
+        if not self.trak_video:
+            messagebox.showinfo("No Video", "No tracking video to save. Please run tracking first.")
+            return
+
+        initial_filename = f"{os.path.splitext(self.video_file)[0]}_tracked.mp4"
+        Tk().withdraw()
+        save_file = asksaveasfilename(initialfile=initial_filename,
+                                      defaultextension=".mp4",
+                                      filetypes=[("MP4 video file", "*.mp4"), ("All files", "*.*")],
+                                      title="Save Tracked Video")
+        if not save_file:
+            print("Video saving cancelled.")
+            return
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(filename=save_file, fourcc=fourcc, fps=fps,
+                              frameSize=(self.width, self.height), isColor=True)
+
+        for frame in tqdm(self.trak_video, desc="Saving video"):
+            out.write(frame)
+
+        out.release()
+        print(f"Tracked video saved successfully to {save_file}")
+
+
+    def trim_video(self, trim):
+        """
+        Provides an interactive UI to select a start and end frame.
+
+        Args:
+            trim (bool): If True, the video buffer will be permanently trimmed
+                         to the selected range. If False, it only returns the
+                         selected range without modifying the buffer.
+
+        Returns:
+            tuple[int, int]: The selected start and end frame numbers.
+        """
+        def _move(frame_n):
+            self.frame_num = frame_n
+
+        win_name = "Trim Video | s: start, e: end, f: fwd, b: back, Esc: exit"
         cv2.namedWindow(win_name)
-        cv2.resizeWindow(win_name, win_width, win_heigth)
-        cv2.createTrackbar(track_name, win_name, 0, self.length, _move)
-        self.frame_num = 0
-        cv2.setTrackbarPos(track_name, win_name, self.frame_num)
+        start, end = 0, self.length - 1
+        cv2.createTrackbar("Frame #:", win_name, 0, self.length - 1, _move)
+
         while True:
-            f = self.video_buffer[self.frame_num]
-            f = cv2.resize(f, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_CUBIC)
-            cv2.imshow(win_name, f)
-            k=cv2.waitKey(int(1000/self.fps))&0xFF
-            if k==27:
-                break
+            frame = self.video_buffer[self.frame_num]
+            display_frame = frame.copy()
+            cv2.putText(display_frame, f'Start: {start} | End: {end}', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            cv2.imshow(win_name, display_frame)
+
+            k = cv2.waitKey(30) & 0xFF
+            if k == ord("s"): start = self.frame_num
+            elif k == ord("e"): end = self.frame_num
+            elif k == ord("f"): self.frame_num = min(self.frame_num + 1, self.length - 1)
+            elif k == ord("b"): self.frame_num = max(0, self.frame_num - 1)
+            elif k == 27: break
+            cv2.setTrackbarPos("Frame #:", win_name, self.frame_num)
+        
+        cv2.destroyAllWindows()
+        # Ensure start is before end
+        start, end = min(start, end), max(start, end)
+
+        if trim:
+            self.video_buffer = self.video_buffer[start:end, ...]
+            self.length = self.video_buffer.shape[0]
+            print(f"Video trimmed to frames {start} through {end}. New length: {self.length} frames.")
+
+        return start, end
+
+
+    def play_video(self):
+        """Plays the video currently loaded in the buffer with a trackbar."""
+        if not hasattr(self, 'video_buffer') or self.length == 0:
+            messagebox.showerror("Error", "No video loaded.")
+            return
+
+        def _move(frame_n):
+            self.frame_num = frame_n
+
+        win_name = f"Play Video: {os.path.basename(self.video_file)}"
+        cv2.namedWindow(win_name)
+        cv2.createTrackbar("Frame #:", win_name, 0, self.length - 1, _move)
+        
+        self.frame_num = 0
+        while True:
+            if self.frame_num >= self.length: break
+            
+            cv2.setTrackbarPos("Frame #:", win_name, self.frame_num)
+            cv2.imshow(win_name, self.video_buffer[self.frame_num])
+            
+            k = cv2.waitKey(int(1000 / self.fps)) & 0xFF
+            if k == 27: break
+            
             self.frame_num += 1
-            if self.frame_num >= self.length:
-                break
-            cv2.setTrackbarPos(track_name, win_name, self.frame_num)
-        cv2.destroyAllWindows()     
+            
+        cv2.destroyAllWindows()
+
 
 class Gui:
+    """A simple Tkinter GUI to interact with the VideoUtil class."""
     def __init__(self):
-        
+        """Initializes the GUI window and its widgets."""
         self.video_loaded = False
+        self.video_util = None
+
         self.window = Tk()
-        self.window.wm_title('Video tracker')
+        self.window.wm_title('Video Motion Tracker')
 
-        self.b1 = Button(self.window, text='Load Video', command=self.load_video, width=25)
-        self.b1.grid(row=1, column=1)
-
-        self.b2 = Button(self.window, text='Set area to track', command=self.get_roi, width=25)
-        self.b2.grid(row=2, column=1)
-
-        self.b3 = Button(self.window, text='Set pixel size (cm)', command=self.set_pxl_size, width=25)
-        self.b3.grid(row=3, column=1)
-
-        self.b4 = Button(self.window, text='Track motion', command=self.video_track, width=25)
-        self.b4.grid(row=4, column=1)
-        
-        self.b5 = Button(self.window, text='Trim video', command=self.trim_video, width=25)
-        self.b5.grid(row=5, column=1)
-
-        self.b6 = Button(self.window, text='Save video', command=self.save_tracked, width=25)
-        self.b6.grid(row=6, column=1)
-
-        self.b7 = Button(self.window, text='Play video', command=self.play_video, width=25)
-        self.b7.grid(row=7, column=1)
-        
-        self.b8 = Button(self.window, text='Exit', command=self.quite, width=25)
-        self.b8.grid(row=8, column=1)
+        # --- GUI Buttons ---
+        btn_width = 25
+        Button(self.window, text='Load Video', command=self.load_video, width=btn_width).grid(row=1, column=1, padx=5, pady=2)
+        Button(self.window, text='Set Area to Track (ROI)', command=self.get_roi, width=btn_width).grid(row=2, column=1, padx=5, pady=2)
+        Button(self.window, text='Set Pixel Size (Calibration)', command=self.set_pxl_size, width=btn_width).grid(row=3, column=1, padx=5, pady=2)
+        Button(self.window, text='Track Motion', command=self.video_track, width=btn_width).grid(row=4, column=1, padx=5, pady=2)
+        Button(self.window, text='Trim Video', command=self.trim_video, width=btn_width).grid(row=5, column=1, padx=5, pady=2)
+        Button(self.window, text='Save Tracked Video', command=self.save_tracked, width=btn_width).grid(row=6, column=1, padx=5, pady=2)
+        Button(self.window, text='Play Original Video', command=self.play_video, width=btn_width).grid(row=7, column=1, padx=5, pady=2)
+        Button(self.window, text='Exit', command=self.quit, width=btn_width).grid(row=8, column=1, padx=5, pady=5)
 
         self.window.mainloop()
-        
+
+    def _check_video_loaded(self):
+        """Helper to check if a video is loaded before calling methods."""
+        if not self.video_loaded:
+            messagebox.showerror('No Video Selected', 'Please load a video first.')
+            return False
+        return True
+
     def load_video(self):
-        
-        self.video = Video_utill()
-        self.video_loaded = True
-        
+        """Loads a video using VideoUtil."""
+        try:
+            self.video_util = VideoUtil()
+            self.video_loaded = True
+            messagebox.showinfo("Success", "Video loaded successfully.")
+        except (FileNotFoundError, IOError) as e:
+            messagebox.showerror("Error", str(e))
+            self.video_loaded = False
+
     def get_roi(self):
-        if not self.video_loaded:
-            messagebox.showerror('No video selected error', 'Please load video first')
-        else:
-            self.video.set_roi()
-        
+        """Sets the tracking ROI."""
+        if self._check_video_loaded(): self.video_util.set_roi()
+
     def set_pxl_size(self):
-        if not self.video_loaded:
-            messagebox.showerror('No video selected error', 'Please load video first')
-        else:
-            self.video.set_pxl_size()
-        
-    def video_track(self):  
-        if not self.video_loaded:
-            messagebox.showerror('No video selected error', 'Please load video first')
-        else:
-            self.video.track()
-            
+        """Sets the pixel size for calibration."""
+        if self._check_video_loaded(): self.video_util.set_pxl_size()
+
+    def video_track(self):
+        """Runs the motion tracking."""
+        if self._check_video_loaded(): self.video_util.track()
+
     def save_tracked(self):
-        if not self.video_loaded:
-            messagebox.showerror('No video selected error', 'Please load video first')
-        else:
-            self.video.save_tracking_video(fps=30)
+        """Saves the generated tracked video."""
+        if self._check_video_loaded(): self.video_util.save_tracking_video(fps=30)
 
     def trim_video(self):
-        if not self.video_loaded:
-            messagebox.showerror('No video selected error', 'Please load video first')
-        else:
-            self.video.trim_video(trim=True)
+        """Trims the video buffer."""
+        if self._check_video_loaded(): self.video_util.trim_video(trim=True)
 
     def play_video(self):
-        if not self.video_loaded:
-            messagebox.showerror('No video selected error', 'Please load video first')
-        else:
-            self.video.play_video()   
+        """Plays the original video."""
+        if self._check_video_loaded(): self.video_util.play_video()
 
-    def quite(self):
+    def quit(self):
+        """Destroys the GUI window and exits."""
         self.window.destroy()
 
 
-
-    
-
-ap = argparse.ArgumentParser()
-ap.add_argument("-m", "--mode", default="manual", help="True for automatic mode - manual or aouto")
-ap.add_argument("-v", "--path", default="", help="Path to video file")
-
-
-if __name__=='__main__':
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description="Video Motion Tracking Utility")
+    ap.add_argument("-m", "--mode", default="manual", choices=["manual", "auto"],
+                    help="Execution mode: 'manual' (GUI) or 'auto' (scripted).")
+    ap.add_argument("-v", "--path", default="", help="Path to the video file for 'auto' mode.")
     args = ap.parse_args()
-    if args.mode=="auto":
-        v = Video_util(args.video_file)
-        v.set_roi()
-        v.set_pxl_size()
-        v.track(draw_speeds=True)
-        v.save_tracking_video(fps=5)
+
+    if args.mode == "auto":
+        if not args.path:
+            print("Error: For 'auto' mode, you must provide a video path using -v or --path.")
+        else:
+            try:
+                # This mode still requires user interaction for ROI/calibration
+                print("--- Running in Automated Sequence Mode ---")
+                v = VideoUtil(args.path)
+                print("Step 1: Set Region of Interest (ROI)")
+                v.set_roi()
+                print("Step 2: Set Pixel Size for Calibration")
+                v.set_pxl_size()
+                print("Step 3: Track Motion")
+                v.track(draw_speeds=True)
+                print("Step 4: Save Tracked Video")
+                v.save_tracking_video(fps=10)
+                print("--- Automated Sequence Complete ---")
+            except Exception as e:
+                print(f"An error occurred during auto mode: {e}")
     else:
-        g = Gui(args)
+        # Default mode: launch the Tkinter GUI
+        Gui()
