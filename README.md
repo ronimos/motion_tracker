@@ -107,6 +107,10 @@ python motion_tracker.py --mode auto --path /path/to/video.mp4
 
 ## Output
 
+**Sign convention:** `+x` is rightward and **`+y` is upward** (the raw image
+Y axis is flipped so output follows the usual physics/math convention rather than
+screen coordinates). This applies to every y column and the `dy/dt` readout.
+
 - **CSV** — one row per frame. Columns `p0_x, p0_y, p1_x, p1_y, …` give each
   tracked point's raw displacement (in meters if calibrated, otherwise pixels).
   When stabilization is on, matching `p0_x_corr, p0_y_corr, …` columns hold the
