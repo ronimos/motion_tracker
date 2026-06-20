@@ -1,0 +1,13 @@
+# Sample / input media
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Tracker outputs
+*_tracked.mp4
+*_track_frames_*.csv
+spd_chart.png
