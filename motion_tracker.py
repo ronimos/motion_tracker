@@ -31,6 +31,8 @@ import pandas as pd
 from tkinter import Tk, Button, simpledialog, messagebox
 from tkinter.filedialog import askopenfilename, asksaveasfilename
 from tqdm import tqdm, tqdm_gui
+import matplotlib
+matplotlib.use("Agg")  # headless-safe: speed plots are saved to PNG and overlaid, never shown
 import matplotlib.pyplot as plt
 import warnings
 import argparse
@@ -48,15 +50,23 @@ class VideoUtil:
     selecting a region of interest (ROI), calibrating scale, tracking features
     using Lucas-Kanade optical flow, and saving the results.
     """
-    def __init__(self, video_file=''):
+    def __init__(self, video_file='', interactive=True):
         """
         Initializes the VideoUtil object.
 
         Args:
             video_file (str, optional): The path to the video file.
                                         If empty, a file dialog will open.
+            interactive (bool): When True, user prompts (calibration values, save
+                                paths, notices) use Tk dialogs. When False they
+                                fall back to the console and sensible defaults, so
+                                the tracker runs without Tkinter (e.g. 'auto' mode
+                                or on systems with a broken Tk install).
         """
+        self.interactive = interactive
         if not video_file:
+            if not interactive:
+                raise FileNotFoundError("No video file provided (required in non-interactive mode).")
             # Hide the root Tkinter window and open a file dialog.
             Tk().withdraw()
             self.video_file = askopenfilename(title="Select a video file")
@@ -197,6 +207,41 @@ class VideoUtil:
         self.mask[top_y:bot_y, left_x:right_x] = 255
 
 
+    def _prompt(self, message):
+        """
+        Ask the user for a string value. Uses a Tk dialog when interactive,
+        otherwise falls back to a console prompt so no Tkinter is required.
+        Returns the entered string, or None if blank/cancelled.
+        """
+        if self.interactive:
+            Tk().withdraw()
+            return simpledialog.askstring(title="Motion Tracker", prompt=message)
+        try:
+            resp = input(message + " ").strip()
+        except EOFError:
+            return None
+        return resp or None
+
+    def _notify(self, title, message):
+        """Show an informational message (Tk dialog when interactive, else print)."""
+        if self.interactive:
+            messagebox.showinfo(title, message)
+        else:
+            print(f"{title}: {message}")
+
+    def _save_path(self, default_path, filetypes, title):
+        """
+        Resolve a path to save to. Uses a Tk save dialog when interactive,
+        otherwise auto-saves to ``default_path`` (no Tkinter required).
+        """
+        if self.interactive:
+            Tk().withdraw()
+            return asksaveasfilename(initialfile=default_path,
+                                     defaultextension=os.path.splitext(default_path)[1],
+                                     filetypes=filetypes, title=title)
+        print(f"{title} -> {default_path}")
+        return default_path
+
     def set_pxl_size(self):
         """
         Calibrates the pixel-to-meter ratio.
@@ -232,23 +277,15 @@ class VideoUtil:
         height_px = abs(self.ul_cr[1] - self.lr_cr[1]) * zoom
         width_px = abs(self.ul_cr[0] - self.lr_cr[0]) * zoom
 
-        Tk().withdraw() # Hide root Tkinter window
-
         # --- Get real-world height ---
-        rect_height_m_str = simpledialog.askstring(
-            title="Pixel Size Calibration",
-            prompt="Enter rectangle height in meters (or leave blank if unknown):"
-        )
+        rect_height_m_str = self._prompt("Enter rectangle height in meters (blank if unknown):")
         try:
             self.pix_height = float(rect_height_m_str) / height_px
         except (ValueError, TypeError, ZeroDivisionError):
             self.pix_height = None
 
         # --- Get real-world width ---
-        rect_width_m_str = simpledialog.askstring(
-            title="Pixel Size Calibration",
-            prompt="Enter rectangle width in meters (or leave blank if unknown):"
-        )
+        rect_width_m_str = self._prompt("Enter rectangle width in meters (blank if unknown):")
         try:
             self.pix_width = float(rect_width_m_str) / width_px
         except (ValueError, TypeError, ZeroDivisionError):
@@ -327,7 +364,7 @@ class VideoUtil:
                               background features.
         """
         self.trak_video = []
-        if messagebox.askyesno("Frame Range", "Do you want to track a specific range of frames?"):
+        if self.interactive and messagebox.askyesno("Frame Range", "Do you want to track a specific range of frames?"):
             start_frame, end_frame = self.trim_video(trim=False)
         else:
             start_frame, end_frame = 0, self.length
@@ -342,7 +379,7 @@ class VideoUtil:
         p0 = cv2.goodFeaturesToTrack(old_gray, mask=mask_gray, **self.feature_params)
 
         if p0 is None:
-            messagebox.showerror("Tracking Error", "No features found in the selected ROI.")
+            self._notify("Tracking Error", "No features found in the selected ROI.")
             return
 
         # --- Background features for camera-motion compensation ---
@@ -477,11 +514,9 @@ class VideoUtil:
 
         # --- Save Motion Data to CSV ---
         initial_filename = f"{os.path.splitext(self.video_file)[0]}_track_frames_{start_frame}_to_{end_frame}.csv"
-        Tk().withdraw()
-        save_filename = asksaveasfilename(initialfile=initial_filename,
-                                          defaultextension=".csv",
-                                          filetypes=[("CSV (Comma-separated)", "*.csv"), ("All Files", "*.*")],
-                                          title="Save Motion Data")
+        save_filename = self._save_path(initial_filename,
+                                        [("CSV (Comma-separated)", "*.csv"), ("All Files", "*.*")],
+                                        "Save Motion Data")
         if save_filename:
             motion_df.to_csv(save_filename, index=False)
             print(f"Motion data saved to {save_filename}")
@@ -548,15 +583,13 @@ class VideoUtil:
             fps (int): The frames per second for the output video.
         """
         if not self.trak_video:
-            messagebox.showinfo("No Video", "No tracking video to save. Please run tracking first.")
+            self._notify("No Video", "No tracking video to save. Please run tracking first.")
             return
 
         initial_filename = f"{os.path.splitext(self.video_file)[0]}_tracked.mp4"
-        Tk().withdraw()
-        save_file = asksaveasfilename(initialfile=initial_filename,
-                                      defaultextension=".mp4",
-                                      filetypes=[("MP4 video file", "*.mp4"), ("All files", "*.*")],
-                                      title="Save Tracked Video")
+        save_file = self._save_path(initial_filename,
+                                    [("MP4 video file", "*.mp4"), ("All files", "*.*")],
+                                    "Save Tracked Video")
         if not save_file:
             print("Video saving cancelled.")
             return
@@ -728,9 +761,11 @@ if __name__ == '__main__':
             print("Error: For 'auto' mode, you must provide a video path using -v or --path.")
         else:
             try:
-                # This mode still requires user interaction for ROI/calibration
+                # ROI/calibration still use OpenCV windows (mouse), but all
+                # text prompts and save paths fall back to the console so this
+                # mode needs no Tkinter.
                 print("--- Running in Automated Sequence Mode ---")
-                v = VideoUtil(args.path)
+                v = VideoUtil(args.path, interactive=False)
                 print("Step 1: Set Region of Interest (ROI)")
                 v.set_roi()
                 print("Step 2: Set Pixel Size for Calibration")
