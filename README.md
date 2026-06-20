@@ -19,7 +19,10 @@ within a chosen area.
 - **Camera-motion compensation** — tracks background features outside the ROI to
   estimate the camera's own motion (pan/rotate/zoom via partial-affine + RANSAC,
   with a median-translation fallback) and subtracts it, so a handheld or panning
-  camera doesn't show up as false object motion.
+  camera doesn't show up as false object motion. By default it uses everything
+  outside the ROI as the reference; you can also **mark explicit static area(s)**
+  for scenes where the background contains moving distractions (people, trees,
+  water).
 - **Annotated video** — tracked points, motion trails, median dx/dt and dy/dt
   text, and an optional overlaid speed-vs-frame plot.
 - **Data export** — per-frame displacement of every tracked point saved to CSV.
@@ -61,20 +64,26 @@ This opens the **Video Motion Tracker** window. The typical workflow is:
 2. **Set Area to Track (ROI)** — scrub to a frame and draw a rectangle around the
    region to track. Press `-` to zoom out if the frame is larger than the screen,
    then `Esc` to save.
-3. **Set Pixel Size (Calibration)** — draw a rectangle over an object of known
+3. **Set Static Area (optional)** — draw one or more rectangles over parts of the
+   scene that are genuinely still, to use *only* those for stabilization. Recommended
+   when the background has moving distractions (people, wind-blown trees, water).
+   Drag a box, `a`/`Enter` to add it, `c` to clear, `-` to zoom, `Esc` to finish.
+   Skip this to use the default (everything outside the ROI).
+4. **Set Pixel Size (Calibration)** — draw a rectangle over an object of known
    size and enter its height and/or width in meters. (Skip this to keep results in
    pixels.)
-4. **Track Motion** — optionally restrict to a frame range, then watch the points
+5. **Track Motion** — optionally restrict to a frame range, then watch the points
    get tracked. You'll be prompted to save the motion data as CSV.
-5. **Save Tracked Video** — write the annotated video to an MP4.
+6. **Save Tracked Video** — write the annotated video to an MP4.
 
 Additional buttons: **Trim Video** (permanently crop the loaded buffer to a frame
 range) and **Play Original Video**.
 
 ### Auto mode
 
-Runs the load → ROI → calibrate → track → save sequence in order. The ROI and
-calibration steps are still interactive.
+Runs the load → ROI → (optional static area) → calibrate → track → save sequence
+in order. The ROI, static-area, and calibration steps are still interactive (it
+asks on the console whether to mark a static area).
 
 ```bash
 python motion_tracker.py --mode auto --path /path/to/video.mp4
@@ -131,10 +140,17 @@ the object's motion *relative to the scene* rather than apparent motion from a
 moving camera. When fewer than three background points survive, it falls back to a
 median-translation estimate; with none, that frame is left uncorrected.
 
-Disable it (e.g. for a tripod-mounted camera, or to compare) with
-`track(stabilize=False)`. Watch the `bg pts` overlay / `bg_points` column: a low
-count means the camera estimate is unreliable, which happens when the moving
-object fills most of the frame.
+**Choosing the reference area.** By default "background" means everything outside
+the (dilated) ROI. That assumes the rest of the scene is static — which breaks if
+it contains moving people, wind-blown trees, water, etc. Use **Set Static Area** to
+draw one or more rectangles over parts you know are still; the stabilizer then draws
+its reference features *only* from those (still excluding the tracked object). The
+tracked object always feeds the ROI motion, never the camera estimate.
+
+Disable stabilization entirely (e.g. for a tripod-mounted camera, or to compare)
+with `track(stabilize=False)`. Watch the `bg pts` overlay / `bg_points` column: a
+low count means the camera estimate is unreliable — which happens when the moving
+object fills most of the frame, or when a too-small static area was selected.
 
 ## Notes
 

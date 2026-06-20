@@ -96,6 +96,7 @@ class VideoUtil:
         self.trak_video = []   # Buffer for tracked video frames
         self.frame_num = 0     # Current frame number for UI interactions
         self.drawing = False   # Flag for mouse drawing events
+        self.stab_mask = None  # Optional user-marked static area for stabilization
         self.ix, self.iy = -1, -1 # Initial drawing coordinates
 
         # Pre-load video frames into memory.
@@ -205,6 +206,64 @@ class VideoUtil:
         left_x = self.ul_cr[0] * zoom
         right_x = self.lr_cr[0] * zoom
         self.mask[top_y:bot_y, left_x:right_x] = 255
+
+
+    def set_static_area(self):
+        """
+        Mark one or more *static* reference regions for camera-motion stabilization.
+
+        By default the stabilizer assumes everything outside the tracking ROI is
+        static background. That fails when the scene has moving distractions there
+        (people, wind-blown trees, water). This lets the user draw rectangles over
+        areas that are genuinely still (a building, the ground, a rock) so only
+        those feed the camera-motion estimate.
+
+        Controls: drag to draw a box, 'a' or Enter to add it, 'c' to clear all,
+        '-' to zoom out, Esc to finish. Adding nothing leaves the default
+        (inverse-of-ROI) behavior.
+        """
+        self.drawing = False
+        zoom = 1
+        window_name = 'Draw STATIC areas | drag, a/Enter to add | c clear | - zoom | Esc done'
+        cv2.namedWindow(window_name)
+        cv2.setMouseCallback(window_name, self.on_mouse)
+
+        stab = np.zeros(self.video_buffer[0].shape[:2], dtype=np.uint8)
+        self.img = self.video_buffer[0].copy()
+        self.img_cp = self.img.copy()
+        self.ul_cr = (0, 0)
+        self.lr_cr = (0, 0)
+
+        while True:
+            cv2.imshow(window_name, self.img_cp)
+            k = cv2.waitKey(20) & 0xFF
+            if k == 27:  # Esc: finish
+                break
+            elif k in (ord('a'), 13):  # add the current rectangle to the mask
+                top_y, bot_y = self.ul_cr[1] * zoom, self.lr_cr[1] * zoom
+                left_x, right_x = self.ul_cr[0] * zoom, self.lr_cr[0] * zoom
+                if bot_y > top_y and right_x > left_x:
+                    stab[top_y:bot_y, left_x:right_x] = 255
+                    # Persist the box on the base image so it stays visible while
+                    # further boxes are drawn.
+                    cv2.rectangle(self.img, self.ul_cr, self.lr_cr, (255, 0, 0), 2)
+                    self.img_cp = self.img.copy()
+            elif k == ord('c'):  # clear everything and reset zoom
+                stab[:] = 0
+                zoom = 1
+                self.img = self.video_buffer[0].copy()
+                self.img_cp = self.img.copy()
+            elif k == ord('-'):  # zoom out
+                self.img = cv2.resize(self.img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+                self.img_cp = self.img.copy()
+                zoom *= 2
+
+        cv2.destroyAllWindows()
+        self.stab_mask = stab if stab.any() else None
+        if self.stab_mask is not None:
+            print(f"Static reference area set ({(stab > 0).mean() * 100:.0f}% of frame).")
+        else:
+            print("No static area selected; using default (everything outside the ROI).")
 
 
     def _prompt(self, message):
@@ -387,10 +446,16 @@ class VideoUtil:
         bg_p0 = None
         bg_params = dict(self.feature_params, maxCorners=200)
         if stabilize:
-            # Exclude the ROI (dilated, to avoid edge bleed) so the tracked
-            # object cannot contaminate the camera-motion estimate.
+            # Always exclude the tracked object (dilated ROI, to avoid edge bleed)
+            # so it cannot contaminate the camera-motion estimate.
             roi_dilated = cv2.dilate(mask_gray, np.ones((15, 15), np.uint8))
-            bg_mask = cv2.bitwise_not(roi_dilated)
+            if self.stab_mask is not None:
+                # User marked explicit static area(s): draw reference features
+                # only from there (minus any overlap with the object).
+                bg_mask = cv2.bitwise_and(self.stab_mask, cv2.bitwise_not(roi_dilated))
+            else:
+                # Default: treat everything outside the ROI as static background.
+                bg_mask = cv2.bitwise_not(roi_dilated)
             bg_p0 = cv2.goodFeaturesToTrack(old_gray, mask=bg_mask, **bg_params)
             if bg_p0 is None:
                 print("Warning: no background features found; stabilization disabled.")
@@ -694,12 +759,13 @@ class Gui:
         btn_width = 25
         Button(self.window, text='Load Video', command=self.load_video, width=btn_width).grid(row=1, column=1, padx=5, pady=2)
         Button(self.window, text='Set Area to Track (ROI)', command=self.get_roi, width=btn_width).grid(row=2, column=1, padx=5, pady=2)
-        Button(self.window, text='Set Pixel Size (Calibration)', command=self.set_pxl_size, width=btn_width).grid(row=3, column=1, padx=5, pady=2)
-        Button(self.window, text='Track Motion', command=self.video_track, width=btn_width).grid(row=4, column=1, padx=5, pady=2)
-        Button(self.window, text='Trim Video', command=self.trim_video, width=btn_width).grid(row=5, column=1, padx=5, pady=2)
-        Button(self.window, text='Save Tracked Video', command=self.save_tracked, width=btn_width).grid(row=6, column=1, padx=5, pady=2)
-        Button(self.window, text='Play Original Video', command=self.play_video, width=btn_width).grid(row=7, column=1, padx=5, pady=2)
-        Button(self.window, text='Exit', command=self.quit, width=btn_width).grid(row=8, column=1, padx=5, pady=5)
+        Button(self.window, text='Set Static Area (optional)', command=self.set_static_area, width=btn_width).grid(row=3, column=1, padx=5, pady=2)
+        Button(self.window, text='Set Pixel Size (Calibration)', command=self.set_pxl_size, width=btn_width).grid(row=4, column=1, padx=5, pady=2)
+        Button(self.window, text='Track Motion', command=self.video_track, width=btn_width).grid(row=5, column=1, padx=5, pady=2)
+        Button(self.window, text='Trim Video', command=self.trim_video, width=btn_width).grid(row=6, column=1, padx=5, pady=2)
+        Button(self.window, text='Save Tracked Video', command=self.save_tracked, width=btn_width).grid(row=7, column=1, padx=5, pady=2)
+        Button(self.window, text='Play Original Video', command=self.play_video, width=btn_width).grid(row=8, column=1, padx=5, pady=2)
+        Button(self.window, text='Exit', command=self.quit, width=btn_width).grid(row=9, column=1, padx=5, pady=5)
 
         self.window.mainloop()
 
@@ -723,6 +789,10 @@ class Gui:
     def get_roi(self):
         """Sets the tracking ROI."""
         if self._check_video_loaded(): self.video_util.set_roi()
+
+    def set_static_area(self):
+        """Marks static reference area(s) for stabilization."""
+        if self._check_video_loaded(): self.video_util.set_static_area()
 
     def set_pxl_size(self):
         """Sets the pixel size for calibration."""
@@ -768,11 +838,14 @@ if __name__ == '__main__':
                 v = VideoUtil(args.path, interactive=False)
                 print("Step 1: Set Region of Interest (ROI)")
                 v.set_roi()
-                print("Step 2: Set Pixel Size for Calibration")
+                print("Step 2: (optional) Set a static area for stabilization")
+                if input("Draw a static reference area? [y/N] ").strip().lower().startswith("y"):
+                    v.set_static_area()
+                print("Step 3: Set Pixel Size for Calibration")
                 v.set_pxl_size()
-                print("Step 3: Track Motion")
+                print("Step 4: Track Motion")
                 v.track(draw_speeds=True)
-                print("Step 4: Save Tracked Video")
+                print("Step 5: Save Tracked Video")
                 v.save_tracking_video(fps=10)
                 print("--- Automated Sequence Complete ---")
             except Exception as e:
