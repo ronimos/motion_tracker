@@ -184,12 +184,19 @@ trajectories via `VideoUtil.track_markers()`, and writes a summary (`*_summary.j
 a per-marker table (`*_markers.csv`), and diagnostic plots (collapse-vs-time,
 onset-vs-position with the speed fit, and the collapse profile) to `--out`.
 
-**Geometry assumptions** (side-view camera): the column is horizontal, the slab
-collapses downward, image x runs along the column, and the saw cut starts at the
-`--cut-from` end (which sets the along-column origin). Calibration sets the spatial
-scale; `--column-length-cm` is needed to judge arrest. Inspect the crack-speed fit
-R² in the summary — a low value means there was no coherent propagation front (or
-the ROI/scale/cut direction need adjusting).
+**Geometry** (side-view camera): the column's long axis is fitted from the initial
+marker positions (PCA), so a tilted-in-frame column is handled — along-column
+position is the projection onto that axis and collapse is the component normal to
+it (the reported `column_tilt_deg` shows the fitted tilt). The saw cut starts at the
+`--cut-from` end (sets the along-column origin) and calibration sets the scale.
+
+`--column-length-cm` is compared against the tracked extent to judge arrest: if the
+ROI/markers don't reach close to the column end, **propagation distance and arrest
+can't be trusted** — the tool reports `arrested: null` (indeterminate) and prints a
+coverage warning, since a crack reaching the edge of the ROI is indistinguishable
+from one that kept going. Extend the ROI to span the full column for reliable arrest
+detection. Also inspect the crack-speed fit R²: a low value means no coherent
+propagation front (or the ROI/scale/cut direction need adjusting).
 
 ## Notes
 
