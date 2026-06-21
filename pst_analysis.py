@@ -92,17 +92,27 @@ class PSTAnalyzer:
         pos = self.pos
         F, N, _ = pos.shape
 
-        x0 = pos[0, :, 0]                       # initial pixel x of each marker
-        y = pos[:, :, 1]                        # (F, N) pixel y over time
+        # Work in metric space (meters) so the fitted axis isn't distorted by
+        # different horizontal/vertical pixel scales.
+        Pm = pos.copy()
+        Pm[:, :, 0] *= self.sx
+        Pm[:, :, 1] *= self.sy
+        P0 = Pm[0]                              # (N, 2) initial marker positions, m
 
-        # Along-column position (m), origin at the cut end.
+        # --- Column axis from the initial marker spread (PCA), handles tilt ---
+        e, n, tilt = self._column_axis(P0)
+        self.axis, self.normal, self.tilt_deg = e, n, tilt
+
+        # Along-column position (m): project onto the axis, origin at the cut end.
+        proj = (P0 - P0.mean(axis=0)) @ e       # centered projection (m)
         if self.cut_from == 'right':
-            X = (np.nanmax(x0) - x0) * self.sx
+            X = proj.max() - proj
         else:  # 'left'
-            X = (x0 - np.nanmin(x0)) * self.sx
+            X = proj - proj.min()
 
-        # Vertical displacement, downward-positive, in mm (collapse).
-        w = (y - y[0]) * self.sy * 1000.0       # (F, N) mm
+        # Collapse (mm): displacement component normal to the axis, downward-positive.
+        disp = Pm - P0[None, :, :]              # (F, N, 2) m
+        w = (disp @ n) * 1000.0                 # (F, N) mm
 
         # Collapse amplitude per marker = plateau over the final 10% of frames.
         tail = max(1, int(round(0.10 * F)))
@@ -127,6 +137,33 @@ class PSTAnalyzer:
         self.onset = onset
         self.touchdown = touchdown
         self.rise = touchdown - onset
+
+    def _column_axis(self, P0):
+        """
+        Fit the column's long axis from the initial marker positions (PCA).
+
+        Returns (e, n, tilt_deg): the along-column unit vector `e` (oriented
+        toward +x so 'left'/'right' are consistent), the normal unit vector `n`
+        oriented downward in the image (collapse-positive), and the axis tilt
+        from horizontal in degrees. Falls back to the horizontal axis if the
+        markers don't form a clear line.
+        """
+        if P0.shape[0] >= 2:
+            C = P0 - P0.mean(axis=0)
+            _, s, vt = np.linalg.svd(C, full_matrices=False)
+            if s[0] > 0:
+                e = vt[0]
+            else:
+                e = np.array([1.0, 0.0])
+        else:
+            e = np.array([1.0, 0.0])
+        if e[0] < 0:                            # orient toward +x (image right)
+            e = -e
+        n = np.array([-e[1], e[0]])             # perpendicular
+        if n[1] < 0:                            # orient downward (+y image) = collapse
+            n = -n
+        tilt = float(np.degrees(np.arctan2(e[1], e[0])))
+        return e, n, tilt
 
     def _cross_time(self, signal, level):
         """First time (s, linearly interpolated) `signal` reaches `level`."""
@@ -170,20 +207,44 @@ class PSTAnalyzer:
     # Propagation distance and arrest
     # ------------------------------------------------------------------ #
     def _propagation_distance(self):
+        # How far the tracked markers reach along the column, vs the real length.
+        finite = np.isfinite(self.X)
+        self.marker_span = float(np.nanmax(self.X[finite])) if finite.any() else 0.0
+        spacing = self._marker_spacing()
+        margin = max(0.05 * self.column_length, 2.0 * spacing)
+        # Does the tracked region cover (close to) the full column?
+        self.coverage_ok = self.marker_span >= (self.column_length - margin)
+
         if not np.any(self.collapsed):
             self.prop_distance = 0.0
-            self.arrested = True
-            self.arrest_X = 0.0
+            self.arrested = None                # nothing collapsed: can't say
+            self.arrest_X = None
             return
-        Xc = self.X[self.collapsed]
-        front = float(np.nanmax(Xc))            # furthest collapsed marker (m)
+
+        front = float(np.nanmax(self.X[self.collapsed]))   # furthest collapsed marker (m)
         self.prop_distance = front
-        # Arrested if there are markers beyond the front that did NOT collapse.
-        beyond = self.X[~self.collapsed] > front
-        reached_end = front >= (self.column_length - max(0.05 * self.column_length,
-                                                         2.0 * self._marker_spacing()))
-        self.arrested = bool(np.any(beyond)) and not reached_end
-        self.arrest_X = front if self.arrested else np.nan
+
+        # Evidence types:
+        beyond_intact = bool(np.any(self.X[~self.collapsed] > front + spacing))
+        reached_column_end = front >= (self.column_length - margin)
+        reached_marker_edge = front >= (self.marker_span - max(spacing, 1e-9))
+
+        if beyond_intact:
+            # Directly observed: collapse stops while intact markers remain ahead.
+            self.arrested = True
+            self.arrest_X = front
+        elif reached_column_end:
+            # Propagated to (near) the actual column end.
+            self.arrested = False
+            self.arrest_X = None
+        elif reached_marker_edge and not self.coverage_ok:
+            # Crack reached the edge of the tracked region, but that edge is short
+            # of the column end - can't tell arrest from running out of ROI.
+            self.arrested = None
+            self.arrest_X = None
+        else:
+            self.arrested = None
+            self.arrest_X = None
 
     def _marker_spacing(self):
         xs = np.sort(self.X[np.isfinite(self.X)])
@@ -218,8 +279,11 @@ class PSTAnalyzer:
             "crack_speed_n_markers": self.speed_n,
             "propagation_distance_m": _round(self.prop_distance, 3),
             "column_length_m": _round(self.column_length, 3),
-            "arrested": bool(self.arrested),
+            "tracked_extent_m": _round(self.marker_span, 3),
+            "roi_covers_column": bool(self.coverage_ok),
+            "arrested": self.arrested,                    # True / False / None (indeterminate)
             "arrest_position_m": _round(self.arrest_X, 3),
+            "column_tilt_deg": _round(self.tilt_deg, 2),
             "touchdown_distance_m": _round(self.touchdown_distance, 3),
             "touchdown_distance_std_m": _round(self.touchdown_distance_std, 3),
             "collapse_mean_mm": _round(float(np.mean(amp_c)) if amp_c.size else np.nan, 2),
@@ -247,11 +311,19 @@ class PSTAnalyzer:
         print("\n=== PST analysis summary ===")
         for k, v in summary.items():
             print(f"  {k:28s}: {v}")
-        if self.arrested:
+        if self.arrested is True:
             print(f"  -> crack ARRESTED at {summary['propagation_distance_m']} m "
                   f"of {summary['column_length_m']} m")
-        else:
+        elif self.arrested is False:
             print(f"  -> crack propagated to the end of the column")
+        else:
+            print(f"  -> arrest INDETERMINATE: collapse reaches {summary['propagation_distance_m']} m "
+                  f"but the tracked region may not cover the full column")
+        if not self.coverage_ok:
+            print(f"  WARNING: tracked region spans only {self.marker_span:.2f} m of the "
+                  f"{self.column_length:.2f} m column - propagation distance and arrest are "
+                  f"limited by ROI/marker coverage, not necessarily the crack. Extend the ROI "
+                  f"to cover the full column for reliable arrest detection.")
 
         # --- files ---
         with open(os.path.join(outdir, f"{prefix}_summary.json"), "w") as fh:
@@ -305,6 +377,8 @@ class PSTAnalyzer:
                        c="lightgray", label="not collapsed")
         ax.axvline(self.prop_distance, color="tab:green", ls="--",
                    label=f"propagation = {self.prop_distance:.2f} m")
+        ax.axvline(self.marker_span, color="tab:orange", ls="-.",
+                   label=f"tracked extent = {self.marker_span:.2f} m")
         ax.axvline(self.column_length, color="k", ls=":",
                    label=f"column end = {self.column_length:.2f} m")
         ax.set_xlabel("along-column position (m)")
@@ -384,7 +458,7 @@ def build_parser():
     p.add_argument("--fps", type=float, default=None, help="Override video fps.")
     p.add_argument("--start", type=int, default=0, help="First frame to track.")
     p.add_argument("--end", type=int, default=None, help="Last frame to track (exclusive).")
-    p.add_argument("--n-markers", type=int, default=100, help="Max features to track in the ROI.")
+    p.add_argument("--n-markers", type=int, default=200, help="Max features to track in the ROI.")
     p.add_argument("--quality", type=float, default=0.05,
                    help="Shi-Tomasi quality threshold for marker detection (lower = more markers).")
     p.add_argument("--min-distance", type=int, default=8,
