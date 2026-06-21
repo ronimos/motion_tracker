@@ -509,6 +509,27 @@ class PSTAnalyzer:
         fig.tight_layout(); fig.savefig(os.path.join(outdir, f"{prefix}_collapse_profile.png"), dpi=130)
         plt.close(fig)
 
+        # 4) Marker overlay on the first frame (where the points are tracked)
+        if self.frame0 is not None:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.imshow(self.frame0[:, :, ::-1])      # BGR -> RGB
+            x0, y0 = self.pos[0, :, 0], self.pos[0, :, 1]
+            cats = [
+                (~self.in_column, "red", "out of column (excluded)"),
+                (self.saw_excluded, "orange", "saw-cut (excluded)"),
+                (self.collapsed & self.in_column & ~self.saw_excluded, "lime", "propagation"),
+                (~self.collapsed & self.in_column & ~self.saw_excluded, "deepskyblue", "not collapsed"),
+            ]
+            for m, color, label in cats:
+                if np.any(m):
+                    ax.scatter(x0[m], y0[m], s=18, c=color, edgecolors="black",
+                               linewidths=0.4, label=f"{label} ({int(m.sum())})")
+            ax.set_title(f"Tracked markers (n={self.amp.size}) on first frame")
+            ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+            ax.axis("off")
+            fig.tight_layout(); fig.savefig(os.path.join(outdir, f"{prefix}_markers_overlay.png"), dpi=130)
+            plt.close(fig)
+
 
 def _round(v, n):
     """Round, turning non-finite values into None for clean JSON/printing."""
@@ -554,7 +575,8 @@ def run(args):
     # 3) Trajectories
     track = v.track_markers(start=args.start, end=args.end, n_markers=args.n_markers,
                             quality_level=args.quality, min_distance=args.min_distance,
-                            stabilize=args.stabilize)
+                            stabilize=args.stabilize, seed=args.seed,
+                            grid_spacing=args.grid_spacing_px)
 
     # 4) Analysis
     analyzer = PSTAnalyzer(track,
@@ -582,7 +604,12 @@ def build_parser():
     p.add_argument("--fps", type=float, default=None, help="Override video fps.")
     p.add_argument("--start", type=int, default=0, help="First frame to track.")
     p.add_argument("--end", type=int, default=None, help="Last frame to track (exclusive).")
-    p.add_argument("--n-markers", type=int, default=200, help="Max features to track in the ROI.")
+    p.add_argument("--n-markers", type=int, default=200, help="Max markers to track in the ROI.")
+    p.add_argument("--seed", choices=["features", "grid"], default="features",
+                   help="Marker seeding: 'features' (corners) or 'grid' (regular grid, "
+                        "better for low-texture snow that yields few corners).")
+    p.add_argument("--grid-spacing-px", type=int, default=25,
+                   help="Grid spacing in pixels when --seed grid.")
     p.add_argument("--quality", type=float, default=0.05,
                    help="Shi-Tomasi quality threshold for marker detection (lower = more markers).")
     p.add_argument("--min-distance", type=int, default=8,
