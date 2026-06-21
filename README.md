@@ -210,7 +210,10 @@ stable trajectories via `VideoUtil.track_markers()`. Two seeding modes:
   when the slab is marked with red paint fiducials; the markers land on the dots
   instead of on incidental corners.
 
-Outputs to `--out`:
+Outputs go to a per-video subdirectory, `<out>/<video name>/`, with the video name as
+the file prefix (so runs on different clips don't collide). For example
+`--out pst_results` on `data/PST_01.mp4` writes `pst_results/PST_01/PST_01_summary.json`,
+etc. The files:
 
 - `*_summary.json` — the metrics above.
 - `*_markers.csv` — per-marker table (position, collapse, onset, etc.).

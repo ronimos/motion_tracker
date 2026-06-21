@@ -738,6 +738,12 @@ def _set_roi_from_arg(v, roi):
 def run(args):
     v = VideoUtil(args.path, interactive=False)
 
+    # Results go in a per-video subdirectory (named after the clip) so runs on
+    # different videos don't overwrite each other.
+    video_stem = os.path.splitext(os.path.basename(args.path))[0]
+    outdir = os.path.join(args.out, video_stem)
+    prefix = args.prefix if args.prefix else video_stem
+
     # 1) Region of interest = the slab (where markers/features live)
     if args.roi:
         _set_roi_from_arg(v, args.roi)
@@ -782,13 +788,13 @@ def run(args):
                            exclude_saw=not args.no_exclude_saw,
                            cut_length_m=(args.cut_length_cm / 100.0
                                          if args.cut_length_cm is not None else None))
-    analyzer.report(outdir=args.out, prefix=args.prefix,
+    analyzer.report(outdir=outdir, prefix=prefix,
                     full_trajectories=args.full_trajectories)
 
     # 5) Annotated event video (markers colored by along-column distance)
     if not args.no_video:
         frames = v.video_buffer[track['start']:track['end']]
-        out_mp4 = os.path.join(args.out, f"{args.prefix}_event.mp4")
+        out_mp4 = os.path.join(outdir, f"{prefix}_event.mp4")
         if analyzer.save_event_video(frames, out_mp4, fps_out=args.video_fps):
             print(f"Wrote annotated event video: {out_mp4}")
 
@@ -842,8 +848,10 @@ def build_parser():
                         "end are excluded as saw-cut (overrides auto detection).")
     p.add_argument("--no-exclude-saw", action="store_true",
                    help="Disable saw-cut exclusion (analyze all collapsed markers).")
-    p.add_argument("--out", default="pst_results", help="Output directory.")
-    p.add_argument("--prefix", default="pst", help="Output file prefix.")
+    p.add_argument("--out", default="pst_results",
+                   help="Base output directory; results go in <out>/<video_name>/.")
+    p.add_argument("--prefix", default=None,
+                   help="Output file prefix (defaults to the video name).")
     return p
 
 
