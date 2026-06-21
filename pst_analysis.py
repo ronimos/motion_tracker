@@ -124,30 +124,73 @@ class PSTAnalyzer:
         # Collapse (mm): displacement component normal to the axis, downward-positive.
         disp = Pm - P0[None, :, :]              # (F, N, 2) m
         w = (disp @ n) * 1000.0                 # (F, N) mm
+        self.X = X
+        self.w = w
 
-        # Collapse amplitude per marker = plateau over the final 10% of frames.
-        tail = max(1, int(round(0.10 * F)))
-        amp = np.nanmedian(w[-tail:], axis=0)   # (N,) mm
+        # --- Dynamic propagation window (from collective collapse velocity) ---
+        # Isolates the fast collapse event from slow pre/post drift, so onset
+        # times reflect the crack front, not gradual settling.
+        self.win0, self.win1 = self._propagation_window(w)
+
+        # Amplitude = collapse during the event: plateau just after the window
+        # minus the baseline just before it (ignores slow drift outside the event).
+        pre = w[:max(1, self.win0)]
+        post = w[self.win1:] if self.win1 < F - 1 else w[-max(1, int(0.02 * F)):]
+        baseline = np.nanmedian(pre, axis=0)
+        plateau = np.nanmedian(post, axis=0)
+        amp = plateau - baseline
         amp = np.where(np.isfinite(amp), amp, 0.0)
 
         onset = np.full(N, np.nan)
         touchdown = np.full(N, np.nan)
         collapsed = amp >= self.min_collapse_mm
 
+        # Search onset/touchdown only within the event window (plus a small pad),
+        # relative to each marker's own pre-event baseline.
+        pad = int(round(0.25 * (self.win1 - self.win0))) + 2
+        lo, hi = max(0, self.win0 - pad), min(F, self.win1 + pad + 1)
         for i in range(N):
             if not collapsed[i]:
                 continue
             wi = w[:, i]
-            onset[i] = self._cross_time(wi, self.onset_frac * amp[i])
-            touchdown[i] = self._cross_time(wi, self.touchdown_frac * amp[i])
+            onset[i] = self._cross_time(wi, baseline[i] + self.onset_frac * amp[i], lo, hi)
+            touchdown[i] = self._cross_time(wi, baseline[i] + self.touchdown_frac * amp[i], lo, hi)
 
-        self.X = X
-        self.w = w
+        self.baseline = baseline
         self.amp = amp
         self.collapsed = collapsed
         self.onset = onset
         self.touchdown = touchdown
         self.rise = touchdown - onset
+
+    def _propagation_window(self, w):
+        """
+        Frame window [f0, f1] of the dynamic collapse event.
+
+        Found from the collective downward-collapse velocity (median |dw/dt| across
+        markers), smoothed, then expanded around its peak down to 25% of the peak.
+        Robust to slow pre/post drift that fools a cumulative-displacement window.
+        """
+        F = w.shape[0]
+        vy = np.abs(np.gradient(np.nan_to_num(w, nan=0.0), axis=0))   # mm/frame
+        coll = np.nanmedian(vy, axis=1)
+        k = max(3, int(round(0.012 * self.fps)))     # ~12 ms smoothing
+        if k % 2 == 0:
+            k += 1
+        coll = np.convolve(coll, np.ones(k) / k, mode='same')
+        self._coll_vel = coll
+        peak = int(np.nanargmax(coll))
+        pv = coll[peak]
+        if not np.isfinite(pv) or pv <= 0:
+            return 0, F - 1
+        thr = 0.25 * pv
+        f0 = peak
+        while f0 > 0 and coll[f0 - 1] > thr:
+            f0 -= 1
+        f1 = peak
+        while f1 < F - 1 and coll[f1 + 1] > thr:
+            f1 += 1
+        return f0, f1
 
     def _flag_outliers(self):
         """
@@ -204,6 +247,15 @@ class PSTAnalyzer:
         if not self.exclude_saw or valid.sum() < 6:
             return  # nothing to do / too few markers to split reliably
 
+        # When a localized propagation window was found, the saw phase is already
+        # outside it (pre-window collapse -> ~zero amplitude -> excluded). The
+        # in-window onsets are too clustered to split, so the knee would only fit
+        # noise. Only run the knee split when the window spans most of the record
+        # (no clear dynamic event isolated).
+        F = self.w.shape[0]
+        if (self.win1 - self.win0) < 0.5 * F:
+            return
+
         idx = np.where(valid)[0]
         order = idx[np.argsort(self.onset[idx])]
         ts = self.onset[order]                      # sorted onset times
@@ -250,13 +302,16 @@ class PSTAnalyzer:
         tilt = float(np.degrees(np.arctan2(e[1], e[0])))
         return e, n, tilt
 
-    def _cross_time(self, signal, level):
-        """First time (s, linearly interpolated) `signal` reaches `level`."""
+    def _cross_time(self, signal, level, lo=0, hi=None):
+        """First time (s, linearly interpolated) `signal` reaches `level`,
+        searching only within frame range [lo, hi)."""
         s = np.asarray(signal, dtype=float)
-        above = s >= level
+        hi = s.size if hi is None else hi
+        seg = s[lo:hi]
+        above = seg >= level
         if not np.any(above):
             return np.nan
-        k = int(np.argmax(above))               # first index at/above level
+        k = int(np.argmax(above)) + lo          # first index at/above level
         if k == 0:
             return self.t[0]
         s0, s1 = s[k - 1], s[k]
@@ -374,6 +429,8 @@ class PSTAnalyzer:
             "crack_speed_m_s": _round(self.speed, 2),
             "crack_speed_fit_r2": _round(self.speed_r2, 3),
             "crack_speed_n_markers": self.speed_n,
+            "propagation_window_s": [_round(self.t[self.win0], 4), _round(self.t[self.win1], 4)],
+            "propagation_window_frames": [int(self.win0), int(self.win1)],
             "critical_cut_length_m": _round(self.critical_cut_length, 3),
             "crack_initiation_s": _round(self.t_init, 4),
             "n_markers_saw_excluded": int(self.saw_excluded.sum()),
@@ -424,10 +481,22 @@ class PSTAnalyzer:
         else:
             print(f"  -> arrest INDETERMINATE: collapse reaches {summary['propagation_distance_m']} m "
                   f"but the tracked region may not cover the full column")
+        print(f"  -> propagation window: {self.t[self.win0]:.3f}-{self.t[self.win1]:.3f} s "
+              f"(frames {self.win0}-{self.win1}); onset/speed use this window only")
+        if np.isfinite(self.speed_r2) and self.speed_r2 < 0.5:
+            win_frames = self.win1 - self.win0
+            print(f"  WARNING: crack-speed fit is poor (R²={self.speed_r2:.2f}). Onsets are "
+                  f"near-simultaneous (the event spans only {win_frames} frames) - the front "
+                  f"likely crossed the tracked region faster than the frame rate resolves. "
+                  f"See the kymograph; a higher fps or a longer tracked span is needed for speed.")
         if self.t_init is not None or self.cut_length_m is not None:
             print(f"  -> saw-cut phase excluded up to {self.critical_cut_length:.2f} m "
                   f"({int(self.saw_excluded.sum())} markers); speed/distance use the "
                   f"propagation phase only")
+        if self.fps <= 60:
+            print(f"  WARNING: fps is {self.fps:.0f}. PST crack propagation is fast "
+                  f"(~10-40 m/s); pass --fps for high-speed footage (e.g. 240) or the "
+                  f"crack speed will be wrong by the frame-rate ratio.")
         if self.scale_warning:
             print(f"  WARNING: tracked extent ({self.raw_extent:.2f} m) exceeds the "
                   f"{self.column_length:.2f} m column. The scale (--mm-per-px / calibration) "
@@ -452,17 +521,50 @@ class PSTAnalyzer:
     # Plots
     # ------------------------------------------------------------------ #
     def _plots(self, outdir, prefix):
-        # 1) Collapse-vs-time curves for collapsed markers
+        # 1) Collapse-vs-time curves, colored by along-column position so the
+        #    left-to-right propagation delay is visible. Window shaded.
         fig, ax = plt.subplots(figsize=(8, 5))
-        idx = np.where(self.collapsed)[0]
-        order = idx[np.argsort(self.X[idx])]
-        for i in order:
-            ax.plot(self.t, self.w[:, i], lw=1, alpha=0.8)
+        idx = np.where(self.collapsed & self.in_column)[0]
+        if idx.size:
+            order = idx[np.argsort(self.X[idx])]
+            xmin, xmax = self.X[order].min(), self.X[order].max()
+            cmap = plt.get_cmap("viridis")
+            for i in order:
+                frac = (self.X[i] - xmin) / (xmax - xmin) if xmax > xmin else 0.5
+                ax.plot(self.t, self.w[:, i], lw=1, alpha=0.85, color=cmap(frac))
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(xmin, xmax))
+            fig.colorbar(sm, ax=ax, label="along-column position (m)")
+        ax.axvspan(self.t[self.win0], self.t[self.win1], color="orange", alpha=0.15,
+                   label="propagation window")
         ax.set_xlabel("time (s)")
         ax.set_ylabel("collapse (mm, downward +)")
-        ax.set_title("Slab marker collapse vs time")
-        ax.grid(alpha=0.3)
+        ax.set_title("Slab marker collapse vs time (color = position)")
+        ax.legend(loc="upper left"); ax.grid(alpha=0.3)
         fig.tight_layout(); fig.savefig(os.path.join(outdir, f"{prefix}_collapse_curves.png"), dpi=130)
+        plt.close(fig)
+
+        # 1b) Kymograph: collapse over (along-column position, time) - the
+        #     propagation front shows as a tilted edge; the window is marked.
+        fig, ax = plt.subplots(figsize=(9, 5))
+        incol = self.in_column & np.isfinite(self.X)
+        if incol.sum() >= 2:
+            nb = min(30, max(6, int(incol.sum())))
+            Xi = self.X[incol]
+            edges = np.linspace(Xi.min(), Xi.max(), nb + 1)
+            binid = np.clip(np.digitize(self.X, edges) - 1, 0, nb - 1)
+            ky = np.full((nb, self.w.shape[0]), np.nan)
+            for b in range(nb):
+                sel = incol & (binid == b)
+                if sel.any():
+                    ky[b] = np.nanmean(self.w[:, sel], axis=1)
+            im = ax.imshow(ky, aspect="auto", origin="lower", cmap="viridis",
+                           extent=[self.t[0], self.t[-1], Xi.min(), Xi.max()])
+            fig.colorbar(im, ax=ax, label="collapse (mm)")
+            ax.axvline(self.t[self.win0], color="white", ls="--", lw=1)
+            ax.axvline(self.t[self.win1], color="white", ls="--", lw=1)
+        ax.set_xlabel("time (s)"); ax.set_ylabel("along-column position (m)")
+        ax.set_title("Collapse kymograph (dashed = propagation window)")
+        fig.tight_layout(); fig.savefig(os.path.join(outdir, f"{prefix}_kymograph.png"), dpi=130)
         plt.close(fig)
 
         # 2) Onset time vs along-column position (crack speed)
@@ -616,7 +718,8 @@ def build_parser():
     p.add_argument("--min-distance", type=int, default=8,
                    help="Minimum pixel spacing between detected markers.")
     p.add_argument("--stabilize", action="store_true",
-                   help="Subtract camera motion using background features.")
+                   help="Camera-motion (noise) compensation from background features. "
+                        "Use for handheld footage; needs good background outside the ROI.")
     p.add_argument("--onset-frac", type=float, default=0.10,
                    help="Fraction of a marker's collapse used as the onset threshold.")
     p.add_argument("--min-collapse-mm", type=float, default=1.0,

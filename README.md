@@ -178,13 +178,20 @@ crack speed. Override with `--cut-length-cm` (manual critical cut) or disable wi
 `--no-exclude-saw`.
 
 ```bash
-# interactive ROI + scale calibration (OpenCV windows + console prompts)
-python pst_analysis.py --path data/PST_01.mp4 --column-length-cm 100 --cut-from left
+# red-painted slab, high-speed footage (interactive ROI + scale calibration)
+python pst_analysis.py --path data/PST_01.mp4 --column-length-cm 200 \
+    --fps 240 --seed color --cut-from left
 
-# non-interactive scale and fixed ROI, with camera stabilization:
-python pst_analysis.py --path data/PST_01.mp4 --column-length-cm 100 \
+# non-interactive scale and fixed ROI, handheld (camera stabilization):
+python pst_analysis.py --path data/PST_01.mp4 --column-length-cm 200 --fps 240 \
     --mm-per-px 0.8 --roi 200,150,1400,400 --stabilize --out pst_results
 ```
+
+> **Frame rate matters.** PST crack propagation is fast (~10–40 m/s), so high-speed
+> footage (≥120–240 fps) is needed to resolve the front. Many cameras write the
+> *playback* fps (e.g. 30) into the file even for 240 fps capture — pass `--fps` with
+> the true capture rate or every time (and the crack speed) is wrong by the ratio.
+> The tool warns when the fps looks too low.
 
 It seeds points in the slab ROI (no physical markers required) and tracks them as
 stable trajectories via `VideoUtil.track_markers()`. Two seeding modes:
@@ -224,6 +231,18 @@ A few such markers are trimmed (reported as `n_outliers_trimmed`); if many fall
 outside, it's treated as a likely scale error — the data is kept but `scale_warning`
 is set and a warning printed, because distances and speed can't be trusted until the
 calibration is fixed.
+
+**Propagation window.** The fast collapse event is isolated automatically from any
+slow pre/post drift: the tool finds the peak of the collective collapse *velocity*
+and the window around it (reported as `propagation_window_s`/`_frames`), then measures
+onset and crack speed **within that window only**. Two diagnostic plots reveal the
+dynamics directly: `*_collapse_curves.png` (collapse vs time, colored by along-column
+position, window shaded) and `*_kymograph.png` (collapse over position × time — a
+**tilted** front means a resolvable propagation speed; a **vertical** edge means the
+collapse is near-simultaneous at the frame rate, so the speed can't be measured). The
+tool warns when the speed fit is poor (R² low / near-simultaneous onsets) — that
+usually means the front crossed the tracked span faster than the fps resolves, so you
+need a higher frame rate or a longer tracked span (not a code problem).
 
 ## Notes
 
