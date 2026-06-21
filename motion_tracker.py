@@ -14,6 +14,18 @@ The application can be run in two modes:
 2.  Auto Mode: A command-line driven mode to run a pre-defined sequence of
     operations (load, set ROI, set pixel size, track, save).
 
+Usage:
+    # Launch the GUI (default mode)
+    python motion_tracker.py
+
+    # Run the scripted sequence on a given video (no Tkinter required)
+    python motion_tracker.py --mode auto --path data/Beehive_1.mp4
+    python motion_tracker.py -m auto -v /path/to/video.mp4
+
+Options:
+    -m, --mode   manual (GUI) or auto (scripted sequence)  [default: manual]
+    -v, --path   path to the video file (required for auto mode)
+
 Dependencies:
 - numpy
 - opencv-python
