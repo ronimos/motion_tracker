@@ -682,6 +682,126 @@ class VideoUtil:
         print(f"Tracked video saved successfully to {save_file}")
 
 
+    def track_markers(self, start=0, end=None, n_markers=100,
+                      quality_level=0.05, min_distance=8, stabilize=False):
+        """
+        Track feature points inside the ROI and return their absolute trajectories.
+
+        Unlike track() (which is built for visualization and stores frame-to-frame
+        deltas, dropping/renumbering points as optical flow loses them), this keeps
+        a *stable* marker identity: a point that is lost becomes NaN from then on
+        and is never renumbered, so a trajectory's column index is a fixed marker
+        ID. Intended as the data source for downstream analysis (e.g. PST metrics).
+
+        Args:
+            start, end (int): frame range to track (end defaults to full length).
+            n_markers (int): maximum number of features to detect in the ROI.
+            quality_level (float): Shi-Tomasi quality threshold for detection.
+                              Lower than track()'s default (0.05 vs 0.3) so many
+                              markers are found spread across the column.
+            min_distance (int): minimum pixel spacing between detected markers.
+            stabilize (bool): if True, subtract camera motion (estimated from
+                              background features and integrated frame to frame) so
+                              trajectories are relative to the scene.
+
+        Returns:
+            dict with:
+              'positions'  : (n_frames, n_markers, 2) float32 array of (x, y) pixel
+                             positions; NaN once a marker is lost.
+              'times'      : (n_frames,) array of seconds from `start`.
+              'pix_width'  : meters per pixel, horizontal.
+              'pix_height' : meters per pixel, vertical.
+              'fps'        : frames per second.
+              'start','end': the frame range tracked.
+              'frame0'     : the first frame (BGR) for reference/plotting.
+        """
+        end = self.length if end is None else min(end, self.length)
+        n_frames = end - start
+        if n_frames < 2:
+            raise ValueError("track_markers needs at least two frames.")
+
+        block_size = self.feature_params.get('blockSize', 7)
+        detect_params = dict(maxCorners=int(n_markers), qualityLevel=float(quality_level),
+                             minDistance=int(min_distance), blockSize=block_size)
+        bg_detect_params = dict(detect_params, maxCorners=200)
+        mask_gray = cv2.cvtColor(self.mask, cv2.COLOR_BGR2GRAY)
+
+        old_frame = self.video_buffer[start]
+        prev_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
+        p0 = cv2.goodFeaturesToTrack(prev_gray, mask=mask_gray, **detect_params)
+        if p0 is None:
+            raise RuntimeError("No features found in the ROI to track.")
+        n = len(p0)
+
+        # raw  : pixel positions used to feed optical flow (LK continuity)
+        # pos  : analysis positions (camera-stabilized when requested)
+        raw = np.full((n_frames, n, 2), np.nan, dtype=np.float32)
+        pos = np.full((n_frames, n, 2), np.nan, dtype=np.float32)
+        raw[0] = p0.reshape(n, 2)
+        pos[0] = p0.reshape(n, 2)
+        alive = np.ones(n, dtype=bool)
+
+        # Optional background features for camera-motion compensation.
+        bg_mask = None
+        bg_p0 = None
+        if stabilize:
+            roi_dilated = cv2.dilate(mask_gray, np.ones((15, 15), np.uint8))
+            bg_mask = cv2.bitwise_not(roi_dilated)
+            bg_p0 = cv2.goodFeaturesToTrack(prev_gray, mask=bg_mask, **bg_detect_params)
+            if bg_p0 is None:
+                print("Warning: no background features; trajectories will not be camera-stabilized.")
+                stabilize = False
+
+        print("Tracking marker trajectories...")
+        for f in tqdm(range(1, n_frames), desc="Tracking markers"):
+            frame_gray = cv2.cvtColor(self.video_buffer[start + f], cv2.COLOR_BGR2GRAY)
+
+            # Estimate camera motion (prev -> current) from background points.
+            cam_M = None
+            if stabilize and bg_p0 is not None and len(bg_p0) > 0:
+                bg_new, bg_st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, frame_gray, bg_p0, None, **self.lk_params)
+                if bg_new is not None:
+                    sel = bg_st.ravel() == 1
+                    cam_M, _, _ = self._camera_transform(bg_p0[sel], bg_new[sel])
+                    bg_p0 = bg_new[sel].reshape(-1, 1, 2)
+                if bg_p0 is None or len(bg_p0) < 10:
+                    bg_p0 = cv2.goodFeaturesToTrack(frame_gray, mask=bg_mask, **bg_detect_params)
+
+            idx = np.where(alive)[0]
+            if len(idx) == 0:
+                break
+            pts_in = raw[f - 1, idx].reshape(-1, 1, 2)
+            new, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, frame_gray, pts_in, None, **self.lk_params)
+            st = st.ravel() == 1
+            new = new.reshape(-1, 2)
+            for k, gi in enumerate(idx):
+                if not st[k]:
+                    alive[gi] = False  # leaves the rest of this trajectory as NaN
+                    continue
+                a, b = new[k]
+                raw[f, gi] = (a, b)
+                if stabilize:
+                    c, d = raw[f - 1, gi]
+                    ex, ey = self._apply_affine(cam_M, c, d) if cam_M is not None else (c, d)
+                    px, py = pos[f - 1, gi]
+                    pos[f, gi] = (px + (a - ex), py + (b - ey))
+                else:
+                    pos[f, gi] = (a, b)
+
+            prev_gray = frame_gray
+
+        return {
+            'positions': pos,
+            'times': np.arange(n_frames) / float(self.fps),
+            'pix_width': self.pix_width,
+            'pix_height': self.pix_height,
+            'fps': float(self.fps),
+            'start': start,
+            'end': end,
+            'frame0': old_frame.copy(),
+        }
+
+
     def trim_video(self, trim):
         """
         Provides an interactive UI to select a start and end frame.

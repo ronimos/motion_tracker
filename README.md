@@ -48,6 +48,8 @@ pip install numpy opencv-python pandas tqdm matplotlib
 ## Files
 
 - **`motion_tracker.py`** — the application (the `VideoUtil` tracker and Tkinter GUI).
+- **`pst_analysis.py`** — Propagation Saw Test (PST) analysis built on the tracker
+  (see [PST analysis](#pst-analysis-propagation-saw-test)).
 - **`archive/`** — the superseded original implementation, kept for reference only.
 
 ## Usage
@@ -151,6 +153,43 @@ Disable stabilization entirely (e.g. for a tripod-mounted camera, or to compare)
 with `track(stabilize=False)`. Watch the `bg pts` overlay / `bg_points` column: a
 low count means the camera estimate is unreliable — which happens when the moving
 object fills most of the frame, or when a too-small static area was selected.
+
+## PST analysis (Propagation Saw Test)
+
+`pst_analysis.py` drives the tracker on a side-view PST video and derives
+fracture-propagation metrics from the slab-marker trajectories:
+
+- **Collapse magnitude** — vertical drop of the slab onto the collapsed weak layer,
+  reported as the full along-column profile (amplitude per marker, in mm).
+- **Crack propagation speed** — from each marker's collapse-onset time vs its
+  along-column position (linear fit; the van Herwijnen-style PTV approach).
+- **Propagation distance** — how far the crack travelled from the cut end, and
+  whether it **arrested** before reaching the far end of the column.
+- **Touchdown distance** — the length over which the slab bends from the crack
+  front down to re-contact the collapsed layer behind it (the bending zone),
+  estimated as `crack_speed × marker rise-time`.
+
+```bash
+# interactive ROI + scale calibration (OpenCV windows + console prompts)
+python pst_analysis.py --path data/PST_01.mp4 --column-length-cm 100 --cut-from left
+
+# non-interactive scale and fixed ROI, with camera stabilization:
+python pst_analysis.py --path data/PST_01.mp4 --column-length-cm 100 \
+    --mm-per-px 0.8 --roi 200,150,1400,400 --stabilize --out pst_results
+```
+
+It detects feature points in the slab ROI (no physical markers required — tune
+coverage with `--n-markers`, `--quality`, `--min-distance`), tracks them as stable
+trajectories via `VideoUtil.track_markers()`, and writes a summary (`*_summary.json`),
+a per-marker table (`*_markers.csv`), and diagnostic plots (collapse-vs-time,
+onset-vs-position with the speed fit, and the collapse profile) to `--out`.
+
+**Geometry assumptions** (side-view camera): the column is horizontal, the slab
+collapses downward, image x runs along the column, and the saw cut starts at the
+`--cut-from` end (which sets the along-column origin). Calibration sets the spatial
+scale; `--column-length-cm` is needed to judge arrest. Inspect the crack-speed fit
+R² in the summary — a low value means there was no coherent propagation front (or
+the ROI/scale/cut direction need adjusting).
 
 ## Notes
 
