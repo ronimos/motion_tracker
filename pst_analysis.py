@@ -62,15 +62,24 @@ class PSTAnalyzer:
                                 threshold (default 0.90).
         min_collapse_mm (float): markers whose collapse is below this are treated
                                  as "not collapsed" (noise / ahead of an arrest).
+        exclude_saw (bool): if True, detect crack initiation and exclude the
+                            saw-cut phase from the speed/touchdown/propagation
+                            analysis.
+        cut_length_m (float | None): manual critical-cut length; markers within
+                            this distance of the cut end are treated as saw-cut.
+                            Overrides automatic detection when given.
     """
 
     def __init__(self, track, column_length_m, cut_from='left',
-                 onset_frac=0.10, touchdown_frac=0.90, min_collapse_mm=1.0):
+                 onset_frac=0.10, touchdown_frac=0.90, min_collapse_mm=1.0,
+                 exclude_saw=True, cut_length_m=None):
         self.column_length = float(column_length_m)
         self.cut_from = cut_from
         self.onset_frac = float(onset_frac)
         self.touchdown_frac = float(touchdown_frac)
         self.min_collapse_mm = float(min_collapse_mm)
+        self.exclude_saw = bool(exclude_saw)
+        self.cut_length_m = cut_length_m
 
         self.t = np.asarray(track['times'], dtype=float)        # (F,)
         self.fps = float(track['fps'])
@@ -81,6 +90,8 @@ class PSTAnalyzer:
         self.pos = pos
 
         self._build_per_marker()
+        self._flag_outliers()           # scale / out-of-column features
+        self._detect_crack_initiation()  # split saw-cut phase from propagation
         self._fit_crack_speed()
         self._propagation_distance()
         self._touchdown_distance()
@@ -138,6 +149,80 @@ class PSTAnalyzer:
         self.touchdown = touchdown
         self.rise = touchdown - onset
 
+    def _flag_outliers(self):
+        """
+        Flag markers that fall outside the physical column (stray features on the
+        saw, hand, pit wall, ...). A few are trimmed; many means the scale is
+        probably wrong, so we keep the data but raise a scale warning - distances
+        can't be trusted in that case.
+        """
+        spacing = self._marker_spacing()
+        margin = max(0.05 * self.column_length, 2.0 * spacing)
+        self.raw_extent = float(np.nanmax(self.X)) if np.isfinite(self.X).any() else 0.0
+
+        out = self.X > (self.column_length + margin)
+        frac_out = out.mean() if out.size else 0.0
+        self.n_outliers_trimmed = 0
+
+        if frac_out > 0.20:
+            # Too many to be stray features -> likely a scale error. Keep all
+            # markers (trimming would discard good data and still be mis-scaled)
+            # and warn that distances/speed can't be trusted.
+            self.scale_warning = True
+            self.in_column = np.ones_like(self.X, dtype=bool)
+        else:
+            # A few features outside the column (saw, hand, pit wall): trim them.
+            self.scale_warning = False
+            self.in_column = ~out
+            self.n_outliers_trimmed = int(out.sum())
+
+    def _detect_crack_initiation(self):
+        """
+        Separate the saw-cut phase from the dynamic propagation phase.
+
+        During sawing, markers collapse slowly as the saw advances; at crack
+        initiation the remaining column collapses in a fast burst. On the
+        cumulative-onset-vs-time curve that is a slow rise followed by a steep
+        ramp - the knee is crack initiation. Markers collapsing before it are
+        saw-cut and excluded from speed / touchdown / front analysis.
+
+        A manual `cut_length_m` overrides this; `exclude_saw=False` disables it.
+        """
+        N = self.amp.size
+        self.saw_excluded = np.zeros(N, dtype=bool)
+        self.t_init = None
+        self.critical_cut_length = 0.0
+
+        valid = self.collapsed & self.in_column & np.isfinite(self.onset)
+
+        # Manual override: everything within cut_length of the cut end is saw-cut.
+        if self.cut_length_m is not None:
+            self.saw_excluded = valid & (self.X <= float(self.cut_length_m))
+            self.critical_cut_length = float(self.cut_length_m)
+            return
+
+        if not self.exclude_saw or valid.sum() < 6:
+            return  # nothing to do / too few markers to split reliably
+
+        idx = np.where(valid)[0]
+        order = idx[np.argsort(self.onset[idx])]
+        ts = self.onset[order]                      # sorted onset times
+
+        # Kneedle on the cumulative-onset curve (normalised). For a slow-then-fast
+        # curve the points sit below the endpoint chord; the max gap is the knee.
+        x = (ts - ts[0]) / (ts[-1] - ts[0]) if ts[-1] > ts[0] else np.zeros_like(ts)
+        y = np.linspace(0.0, 1.0, ts.size)
+        gap = x - y
+        k = int(np.argmax(gap))
+
+        # Only split if the knee is pronounced (clear slow phase before a burst).
+        if gap[k] < 0.15 or k == 0:
+            return
+        self.t_init = float(ts[k])
+        self.saw_excluded = valid & (self.onset <= self.t_init)
+        if np.any(self.saw_excluded):
+            self.critical_cut_length = float(np.nanmax(self.X[self.saw_excluded]))
+
     def _column_axis(self, P0):
         """
         Fit the column's long axis from the initial marker positions (PCA).
@@ -183,8 +268,14 @@ class PSTAnalyzer:
     # ------------------------------------------------------------------ #
     # Crack propagation speed: onset time vs along-column position
     # ------------------------------------------------------------------ #
+    def _propagation_mask(self):
+        """Markers used for crack-speed / touchdown: collapsed, inside the
+        column, with a valid onset, and not in the excluded saw-cut phase."""
+        return (self.collapsed & self.in_column & np.isfinite(self.onset)
+                & ~self.saw_excluded)
+
     def _fit_crack_speed(self):
-        mask = self.collapsed & np.isfinite(self.onset)
+        mask = self._propagation_mask()
         X = self.X[mask]
         t = self.onset[mask]
         self.speed = np.nan
@@ -207,25 +298,31 @@ class PSTAnalyzer:
     # Propagation distance and arrest
     # ------------------------------------------------------------------ #
     def _propagation_distance(self):
-        # How far the tracked markers reach along the column, vs the real length.
-        finite = np.isfinite(self.X)
-        self.marker_span = float(np.nanmax(self.X[finite])) if finite.any() else 0.0
+        # Restrict to valid in-column markers (drop out-of-column outliers).
+        incol = self.in_column
+        Xv = self.X[incol]
+        self.marker_span = float(np.nanmax(Xv)) if np.isfinite(Xv).any() else 0.0
         spacing = self._marker_spacing()
         margin = max(0.05 * self.column_length, 2.0 * spacing)
         # Does the tracked region cover (close to) the full column?
         self.coverage_ok = self.marker_span >= (self.column_length - margin)
 
-        if not np.any(self.collapsed):
+        collapsed_in = self.collapsed & incol
+        if not np.any(collapsed_in):
             self.prop_distance = 0.0
             self.arrested = None                # nothing collapsed: can't say
             self.arrest_X = None
             return
 
-        front = float(np.nanmax(self.X[self.collapsed]))   # furthest collapsed marker (m)
-        self.prop_distance = front
+        front = float(np.nanmax(self.X[collapsed_in]))     # furthest collapsed marker (m)
+        # Propagation distance is measured from the critical cut length (the end
+        # of the saw-cut phase), i.e. how far the dynamic crack actually ran.
+        self.prop_distance = max(0.0, front - self.critical_cut_length)
+        self.front_position = front
 
-        # Evidence types:
-        beyond_intact = bool(np.any(self.X[~self.collapsed] > front + spacing))
+        # Evidence types (intact markers must also be inside the column):
+        intact_in = (~self.collapsed) & incol
+        beyond_intact = bool(np.any(self.X[intact_in] > front + spacing))
         reached_column_end = front >= (self.column_length - margin)
         reached_marker_edge = front >= (self.marker_span - max(spacing, 1e-9))
 
@@ -260,7 +357,7 @@ class PSTAnalyzer:
         self.touchdown_distance_std = np.nan
         if not np.isfinite(self.speed):
             return
-        rise = self.rise[self.collapsed & np.isfinite(self.rise)]
+        rise = self.rise[self._propagation_mask() & np.isfinite(self.rise)]
         rise = rise[rise > 0]
         if rise.size == 0:
             return
@@ -272,15 +369,21 @@ class PSTAnalyzer:
     # Reporting
     # ------------------------------------------------------------------ #
     def summary(self):
-        amp_c = self.amp[self.collapsed]
+        amp_c = self.amp[self.collapsed & self.in_column]
         return {
             "crack_speed_m_s": _round(self.speed, 2),
             "crack_speed_fit_r2": _round(self.speed_r2, 3),
             "crack_speed_n_markers": self.speed_n,
+            "critical_cut_length_m": _round(self.critical_cut_length, 3),
+            "crack_initiation_s": _round(self.t_init, 4),
+            "n_markers_saw_excluded": int(self.saw_excluded.sum()),
             "propagation_distance_m": _round(self.prop_distance, 3),
+            "front_position_m": _round(getattr(self, "front_position", np.nan), 3),
             "column_length_m": _round(self.column_length, 3),
             "tracked_extent_m": _round(self.marker_span, 3),
             "roi_covers_column": bool(self.coverage_ok),
+            "scale_warning": bool(self.scale_warning),
+            "n_outliers_trimmed": int(self.n_outliers_trimmed),
             "arrested": self.arrested,                    # True / False / None (indeterminate)
             "arrest_position_m": _round(self.arrest_X, 3),
             "column_tilt_deg": _round(self.tilt_deg, 2),
@@ -289,7 +392,7 @@ class PSTAnalyzer:
             "collapse_mean_mm": _round(float(np.mean(amp_c)) if amp_c.size else np.nan, 2),
             "collapse_max_mm": _round(float(np.max(amp_c)) if amp_c.size else np.nan, 2),
             "n_markers_total": int(self.amp.size),
-            "n_markers_collapsed": int(self.collapsed.sum()),
+            "n_markers_collapsed": int((self.collapsed & self.in_column).sum()),
         }
 
     def per_marker_table(self):
@@ -301,6 +404,8 @@ class PSTAnalyzer:
             "touchdown_s": np.round(self.touchdown, 4),
             "rise_s": np.round(self.rise, 4),
             "collapsed": self.collapsed,
+            "saw_excluded": self.saw_excluded,
+            "in_column": self.in_column,
         }).sort_values("along_column_m").reset_index(drop=True)
 
     def report(self, outdir="pst_results", prefix="pst"):
@@ -319,6 +424,15 @@ class PSTAnalyzer:
         else:
             print(f"  -> arrest INDETERMINATE: collapse reaches {summary['propagation_distance_m']} m "
                   f"but the tracked region may not cover the full column")
+        if self.t_init is not None or self.cut_length_m is not None:
+            print(f"  -> saw-cut phase excluded up to {self.critical_cut_length:.2f} m "
+                  f"({int(self.saw_excluded.sum())} markers); speed/distance use the "
+                  f"propagation phase only")
+        if self.scale_warning:
+            print(f"  WARNING: tracked extent ({self.raw_extent:.2f} m) exceeds the "
+                  f"{self.column_length:.2f} m column. The scale (--mm-per-px / calibration) "
+                  f"is likely wrong, or features outside the column (saw, hand, pit wall) are "
+                  f"being tracked - distances and speed are unreliable until this is fixed.")
         if not self.coverage_ok:
             print(f"  WARNING: tracked region spans only {self.marker_span:.2f} m of the "
                   f"{self.column_length:.2f} m column - propagation distance and arrest are "
@@ -353,14 +467,21 @@ class PSTAnalyzer:
 
         # 2) Onset time vs along-column position (crack speed)
         fig, ax = plt.subplots(figsize=(8, 5))
-        m = self.collapsed & np.isfinite(self.onset)
-        ax.scatter(self.X[m], self.onset[m], s=25, c="tab:red", label="markers")
+        prop = self._propagation_mask()
+        saw = self.saw_excluded & np.isfinite(self.onset)
+        ax.scatter(self.X[prop], self.onset[prop], s=25, c="tab:red", label="propagation")
+        if np.any(saw):
+            ax.scatter(self.X[saw], self.onset[saw], s=22, c="tab:gray", marker="x",
+                       label="saw-cut (excluded)")
         if np.isfinite(self.speed) and hasattr(self, "_speed_fit"):
             slope, intercept = self._speed_fit
-            xs = np.linspace(self.X[m].min(), self.X[m].max(), 50)
+            xs = np.linspace(self.X[prop].min(), self.X[prop].max(), 50)
             ax.plot(xs, slope * xs + intercept, "k--",
                     label=f"fit: c = {self.speed:.1f} m/s  (R²={self.speed_r2:.2f})")
-            ax.legend()
+        if self.critical_cut_length > 0:
+            ax.axvline(self.critical_cut_length, color="tab:purple", ls="-.",
+                       label=f"critical cut = {self.critical_cut_length:.2f} m")
+        ax.legend()
         ax.set_xlabel("along-column position (m)")
         ax.set_ylabel("collapse-onset time (s)")
         ax.set_title("Crack propagation: onset time vs position")
@@ -440,7 +561,10 @@ def run(args):
                            column_length_m=args.column_length_cm / 100.0,
                            cut_from=args.cut_from,
                            onset_frac=args.onset_frac,
-                           min_collapse_mm=args.min_collapse_mm)
+                           min_collapse_mm=args.min_collapse_mm,
+                           exclude_saw=not args.no_exclude_saw,
+                           cut_length_m=(args.cut_length_cm / 100.0
+                                         if args.cut_length_cm is not None else None))
     analyzer.report(outdir=args.out, prefix=args.prefix)
 
 
@@ -469,6 +593,11 @@ def build_parser():
                    help="Fraction of a marker's collapse used as the onset threshold.")
     p.add_argument("--min-collapse-mm", type=float, default=1.0,
                    help="Collapse below this (mm) counts as 'not collapsed'.")
+    p.add_argument("--cut-length-cm", type=float, default=None,
+                   help="Manual critical-cut length in cm; markers within it of the cut "
+                        "end are excluded as saw-cut (overrides auto detection).")
+    p.add_argument("--no-exclude-saw", action="store_true",
+                   help="Disable saw-cut exclusion (analyze all collapsed markers).")
     p.add_argument("--out", default="pst_results", help="Output directory.")
     p.add_argument("--prefix", default="pst", help="Output file prefix.")
     return p
