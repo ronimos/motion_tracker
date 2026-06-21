@@ -682,8 +682,24 @@ class VideoUtil:
         print(f"Tracked video saved successfully to {save_file}")
 
 
+    @staticmethod
+    def _grid_points(mask_gray, spacing, max_points):
+        """Seed a regular grid of points (pixels) over the nonzero ROI mask."""
+        ys, xs = np.where(mask_gray > 0)
+        if xs.size == 0:
+            return None
+        y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
+        gy, gx = np.mgrid[y0:y1 + 1:spacing, x0:x1 + 1:spacing]
+        pts = np.column_stack([gx.ravel(), gy.ravel()]).astype(np.float32)
+        inside = mask_gray[pts[:, 1].astype(int), pts[:, 0].astype(int)] > 0
+        pts = pts[inside]
+        if pts.shape[0] > max_points:                # thin evenly to the cap
+            pts = pts[np.linspace(0, pts.shape[0] - 1, max_points).astype(int)]
+        return pts.reshape(-1, 1, 2)
+
     def track_markers(self, start=0, end=None, n_markers=100,
-                      quality_level=0.05, min_distance=8, stabilize=False):
+                      quality_level=0.05, min_distance=8, stabilize=False,
+                      seed='features', grid_spacing=25):
         """
         Track feature points inside the ROI and return their absolute trajectories.
 
@@ -700,6 +716,10 @@ class VideoUtil:
                               Lower than track()'s default (0.05 vs 0.3) so many
                               markers are found spread across the column.
             min_distance (int): minimum pixel spacing between detected markers.
+            seed (str): 'features' to detect Shi-Tomasi corners, or 'grid' to seed
+                        a regular grid of points across the ROI (better for
+                        low-texture surfaces like snow, which yield few corners).
+            grid_spacing (int): pixel spacing of the grid when seed='grid'.
             stabilize (bool): if True, subtract camera motion (estimated from
                               background features and integrated frame to frame) so
                               trajectories are relative to the scene.
@@ -728,10 +748,19 @@ class VideoUtil:
 
         old_frame = self.video_buffer[start]
         prev_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
-        p0 = cv2.goodFeaturesToTrack(prev_gray, mask=mask_gray, **detect_params)
-        if p0 is None:
-            raise RuntimeError("No features found in the ROI to track.")
+        if seed == 'grid':
+            p0 = self._grid_points(mask_gray, grid_spacing, int(n_markers))
+            if p0 is None:
+                raise RuntimeError("ROI is empty - cannot seed a grid.")
+        else:
+            p0 = cv2.goodFeaturesToTrack(prev_gray, mask=mask_gray, **detect_params)
+            if p0 is None:
+                raise RuntimeError("No features found in the ROI to track.")
         n = len(p0)
+        print(f"Seeding {n} markers ({seed}) in the ROI.")
+        if seed == 'features' and n < 30:
+            print(f"  note: only {n} corners found - the surface may be low-texture. "
+                  f"Try --seed grid, or lower --quality / --min-distance for more points.")
 
         # raw  : pixel positions used to feed optical flow (LK continuity)
         # pos  : analysis positions (camera-stabilized when requested)

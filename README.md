@@ -186,11 +186,20 @@ python pst_analysis.py --path data/PST_01.mp4 --column-length-cm 100 \
     --mm-per-px 0.8 --roi 200,150,1400,400 --stabilize --out pst_results
 ```
 
-It detects feature points in the slab ROI (no physical markers required — tune
-coverage with `--n-markers`, `--quality`, `--min-distance`), tracks them as stable
-trajectories via `VideoUtil.track_markers()`, and writes a summary (`*_summary.json`),
-a per-marker table (`*_markers.csv`), and diagnostic plots (collapse-vs-time,
-onset-vs-position with the speed fit, and the collapse profile) to `--out`.
+It seeds points in the slab ROI (no physical markers required) and tracks them as
+stable trajectories via `VideoUtil.track_markers()`. Two seeding modes:
+
+- `--seed features` (default) — Shi-Tomasi corners; tune with `--n-markers`,
+  `--quality`, `--min-distance`. Good when the slab is textured.
+- `--seed grid` — a regular grid across the ROI (`--grid-spacing-px`). Use this for
+  **low-texture snow**, where corner detection finds only a handful of points
+  (you'll see a "low-texture" note if `features` mode returns few markers).
+
+Outputs to `--out`: a summary (`*_summary.json`), a per-marker table
+(`*_markers.csv`), and diagnostic plots — `*_markers_overlay.png` (every seeded
+point drawn on the first frame, color-coded: propagation / not-collapsed /
+saw-cut / out-of-column, so you can **see and verify coverage**), plus
+collapse-vs-time, onset-vs-position with the speed fit, and the collapse profile.
 
 **Geometry** (side-view camera): the column's long axis is fitted from the initial
 marker positions (PCA), so a tilted-in-frame column is handled — along-column
