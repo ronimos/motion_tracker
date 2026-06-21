@@ -683,6 +683,30 @@ class VideoUtil:
 
 
     @staticmethod
+    def _color_points(frame_bgr, mask_gray, max_points,
+                      sat_min=80, val_min=60, min_area=10, max_area=8000):
+        """
+        Detect red paint-dot centroids (fiducials) within the ROI mask.
+
+        Red wraps around the HSV hue circle, so two ranges are combined. Returns
+        blob centroids (pixels) as an (M, 1, 2) array, or None if none are found.
+        """
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        red = (cv2.inRange(hsv, (0, sat_min, val_min), (12, 255, 255)) |
+               cv2.inRange(hsv, (160, sat_min, val_min), (180, 255, 255)))
+        red = cv2.bitwise_and(red, mask_gray)
+        red = cv2.morphologyEx(red, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        n, _, stats, centroids = cv2.connectedComponentsWithStats(red)
+        pts = [centroids[i] for i in range(1, n)
+               if min_area <= stats[i, cv2.CC_STAT_AREA] <= max_area]
+        if not pts:
+            return None
+        pts = np.array(pts, dtype=np.float32)
+        if pts.shape[0] > max_points:
+            pts = pts[np.linspace(0, pts.shape[0] - 1, max_points).astype(int)]
+        return pts.reshape(-1, 1, 2)
+
+    @staticmethod
     def _grid_points(mask_gray, spacing, max_points):
         """Seed a regular grid of points (pixels) over the nonzero ROI mask."""
         ys, xs = np.where(mask_gray > 0)
@@ -716,9 +740,9 @@ class VideoUtil:
                               Lower than track()'s default (0.05 vs 0.3) so many
                               markers are found spread across the column.
             min_distance (int): minimum pixel spacing between detected markers.
-            seed (str): 'features' to detect Shi-Tomasi corners, or 'grid' to seed
-                        a regular grid of points across the ROI (better for
-                        low-texture surfaces like snow, which yield few corners).
+            seed (str): how to place markers - 'features' (Shi-Tomasi corners),
+                        'grid' (regular grid across the ROI, for low-texture snow),
+                        or 'color' (red paint-dot centroids, for a spray-marked slab).
             grid_spacing (int): pixel spacing of the grid when seed='grid'.
             stabilize (bool): if True, subtract camera motion (estimated from
                               background features and integrated frame to frame) so
@@ -752,6 +776,11 @@ class VideoUtil:
             p0 = self._grid_points(mask_gray, grid_spacing, int(n_markers))
             if p0 is None:
                 raise RuntimeError("ROI is empty - cannot seed a grid.")
+        elif seed == 'color':
+            p0 = self._color_points(old_frame, mask_gray, int(n_markers))
+            if p0 is None:
+                raise RuntimeError("No red paint dots found in the ROI. Check lighting/"
+                                   "colour or use --seed grid.")
         else:
             p0 = cv2.goodFeaturesToTrack(prev_gray, mask=mask_gray, **detect_params)
             if p0 is None:
