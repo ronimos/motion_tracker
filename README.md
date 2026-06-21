@@ -50,6 +50,8 @@ pip install numpy opencv-python pandas tqdm matplotlib
 - **`motion_tracker.py`** — the application (the `VideoUtil` tracker and Tkinter GUI).
 - **`pst_analysis.py`** — Propagation Saw Test (PST) analysis built on the tracker
   (see [PST analysis](#pst-analysis-propagation-saw-test)).
+- **`pst_compare.py`** — compare collapse profiles across PST videos
+  (see [Comparing videos](#comparing-videos)).
 - **`archive/`** — the superseded original implementation, kept for reference only.
 
 ## Usage
@@ -169,13 +171,24 @@ fracture-propagation metrics from the slab-marker trajectories:
   front down to re-contact the collapsed layer behind it (the bending zone),
   estimated as `crack_speed × marker rise-time`.
 
-The **saw-cut phase is detected and excluded**: during sawing, markers collapse
-slowly as the saw advances, then the remaining column collapses in a fast burst at
-crack initiation. The tool finds that transition as the knee in the cumulative
-collapse-onset curve (the critical cut length) and uses only the propagation phase
-for the speed, distance, and touchdown — so hand-sawing speed doesn't bias the
-crack speed. Override with `--cut-length-cm` (manual critical cut) or disable with
-`--no-exclude-saw`.
+**Saw-cut length.** Propagation distance is measured from the critical cut length,
+and the sawn markers are excluded from the speed fit. The cut length is an
+experimental value the operator measures — it can't be reliably inferred from the
+video (the sawn region settles before filming, or the whole slab moves at once), so
+pass it with **`--cut-length-cm`**. Without it the critical cut defaults to 0 (with a
+note), and propagation distance is measured from the column origin.
+
+**Bad-track rejection.** Optical-flow points that lose lock jump to a wild position,
+producing a huge spurious "collapse" (e.g. 70 mm where the slab settled ~2 mm). Such
+markers — collapse far above their *local* neighbours — are flagged (`n_bad_tracks`,
+magenta in the overlay) and excluded from the collapse stats, the speed fit, and the
+front, so a single bad track can't distort the results.
+
+**Arrest needs full coverage.** Arrest (`arrested: true`) is only reported when the
+ROI spans the full column *and* intact markers remain ahead of the collapse front.
+With incomplete coverage it reports `arrested: null` (you can't tell a real arrest
+from the markers simply running out); reaching the column end reports `false`
+(propagated).
 
 ```bash
 # red-painted slab, high-speed footage (interactive ROI + scale calibration)
@@ -261,6 +274,24 @@ collapse is near-simultaneous at the frame rate, so the speed can't be measured)
 tool warns when the speed fit is poor (R² low / near-simultaneous onsets) — that
 usually means the front crossed the tracked span faster than the fps resolves, so you
 need a higher frame rate or a longer tracked span (not a code problem).
+
+### Comparing videos
+
+`pst_compare.py` reads the per-video outputs and compares the collapse magnitude
+along the column between videos, each aligned to its own saw-cut length:
+
+```bash
+python pst_compare.py --base pst_results          # compare every video under pst_results/
+python pst_compare.py pst_results/PST_01 pst_results/PST_02 --out pst_results/_compare
+```
+
+It writes `collapse_comparison.png` — two panels: collapse magnitude vs distance from
+the saw cut (absolute profiles, one curve per video), and the same normalized to the
+near-cut collapse (so the *relative* change as the crack runs is comparable between
+videos: rising = collapse grows with propagation, falling = damping). It also writes
+`collapse_comparison.csv` with per-video stats: critical cut, near/far collapse, the
+collapse slope (mm/m), and the far/near ratio. Bad tracks and out-of-column markers
+are excluded.
 
 ## Notes
 

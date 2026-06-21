@@ -94,7 +94,8 @@ class PSTAnalyzer:
 
         self._build_per_marker()
         self._flag_outliers()           # scale / out-of-column features
-        self._detect_crack_initiation()  # split saw-cut phase from propagation
+        self._flag_bad_tracks()         # optical-flow tracks that lost lock
+        self._detect_crack_initiation()  # saw-cut length from pre-window collapse
         self._fit_crack_speed()
         self._propagation_distance()
         self._touchdown_distance()
@@ -222,61 +223,62 @@ class PSTAnalyzer:
             self.in_column = ~out
             self.n_outliers_trimmed = int(out.sum())
 
+    def _flag_bad_tracks(self):
+        """
+        Flag markers whose collapse is wildly larger than their neighbours' - the
+        signature of an optical-flow track that lost lock and jumped (e.g. a 72 mm
+        "collapse" in a region where the slab settled ~2 mm). Compared against
+        *local* neighbours so a genuine spatial trend in collapse isn't flagged.
+        Flagged markers are excluded from the collapse stats, the speed fit, and
+        the propagation front.
+        """
+        self.bad_track = np.zeros(self.amp.size, dtype=bool)
+        m = self.collapsed & self.in_column
+        idx = np.where(m)[0]
+        if idx.size < 5:
+            return
+        win = max(0.15, 3.0 * self._marker_spacing())
+        for i in idx:
+            neigh = idx[(np.abs(self.X[idx] - self.X[i]) <= win) & (idx != i)]
+            if neigh.size < 3:
+                neigh = idx[idx != i]
+            med = np.median(self.amp[neigh])
+            mad = np.median(np.abs(self.amp[neigh] - med)) + 1e-9
+            # Far above local neighbours by every measure -> a tracking failure.
+            if self.amp[i] > med + 8.0 * mad and self.amp[i] > 3.0 * med and self.amp[i] > 5.0:
+                self.bad_track[i] = True
+
+    def _valid(self):
+        """Markers usable for analysis: inside the column and not a bad track."""
+        return self.in_column & ~self.bad_track
+
     def _detect_crack_initiation(self):
         """
-        Separate the saw-cut phase from the dynamic propagation phase.
+        Estimate the saw-cut length (critical cut) and the saw-cut markers.
 
-        During sawing, markers collapse slowly as the saw advances; at crack
-        initiation the remaining column collapses in a fast burst. On the
-        cumulative-onset-vs-time curve that is a slow rise followed by a steep
-        ramp - the knee is crack initiation. Markers collapsing before it are
-        saw-cut and excluded from speed / touchdown / front analysis.
+        The sawn part of the column has no weak layer left, so it settles *before*
+        the dynamic propagation event. Such markers therefore show collapse already
+        in their pre-window baseline. The critical cut is how far that pre-settled
+        region reaches from the cut end; those markers are excluded from the speed /
+        touchdown / front analysis.
 
-        A manual `cut_length_m` overrides this; `exclude_saw=False` disables it.
+        A manual `cut_length_m` overrides this (recommended - the operator knows the
+        cut length); `exclude_saw=False` disables it. Auto-detection returns ~0 when
+        the slab settles all at once (no distinct sawn-region pre-collapse on
+        camera), in which case pass `--cut-length-cm`.
         """
         N = self.amp.size
         self.saw_excluded = np.zeros(N, dtype=bool)
         self.t_init = None
         self.critical_cut_length = 0.0
 
-        valid = self.collapsed & self.in_column & np.isfinite(self.onset)
-
-        # Manual override: everything within cut_length of the cut end is saw-cut.
+        # The saw-cut length is an experimental value the operator measures; it
+        # can't be reliably inferred from the collapse video (the sawn region
+        # settles before filming, or the whole slab moves at once). So it is taken
+        # from --cut-length-cm when given, and left at 0 (with a note) otherwise.
         if self.cut_length_m is not None:
-            self.saw_excluded = valid & (self.X <= float(self.cut_length_m))
             self.critical_cut_length = float(self.cut_length_m)
-            return
-
-        if not self.exclude_saw or valid.sum() < 6:
-            return  # nothing to do / too few markers to split reliably
-
-        # When a localized propagation window was found, the saw phase is already
-        # outside it (pre-window collapse -> ~zero amplitude -> excluded). The
-        # in-window onsets are too clustered to split, so the knee would only fit
-        # noise. Only run the knee split when the window spans most of the record
-        # (no clear dynamic event isolated).
-        F = self.w.shape[0]
-        if (self.win1 - self.win0) < 0.5 * F:
-            return
-
-        idx = np.where(valid)[0]
-        order = idx[np.argsort(self.onset[idx])]
-        ts = self.onset[order]                      # sorted onset times
-
-        # Kneedle on the cumulative-onset curve (normalised). For a slow-then-fast
-        # curve the points sit below the endpoint chord; the max gap is the knee.
-        x = (ts - ts[0]) / (ts[-1] - ts[0]) if ts[-1] > ts[0] else np.zeros_like(ts)
-        y = np.linspace(0.0, 1.0, ts.size)
-        gap = x - y
-        k = int(np.argmax(gap))
-
-        # Only split if the knee is pronounced (clear slow phase before a burst).
-        if gap[k] < 0.15 or k == 0:
-            return
-        self.t_init = float(ts[k])
-        self.saw_excluded = valid & (self.onset <= self.t_init)
-        if np.any(self.saw_excluded):
-            self.critical_cut_length = float(np.nanmax(self.X[self.saw_excluded]))
+            self.saw_excluded = self._valid() & (self.X <= self.critical_cut_length)
 
     def _column_axis(self, P0):
         """
@@ -329,7 +331,7 @@ class PSTAnalyzer:
     def _propagation_mask(self):
         """Markers used for crack-speed / touchdown: collapsed, inside the
         column, with a valid onset, and not in the excluded saw-cut phase."""
-        return (self.collapsed & self.in_column & np.isfinite(self.onset)
+        return (self.collapsed & self._valid() & np.isfinite(self.onset)
                 & ~self.saw_excluded)
 
     def _fit_crack_speed(self):
@@ -356,16 +358,16 @@ class PSTAnalyzer:
     # Propagation distance and arrest
     # ------------------------------------------------------------------ #
     def _propagation_distance(self):
-        # Restrict to valid in-column markers (drop out-of-column outliers).
-        incol = self.in_column
-        Xv = self.X[incol]
+        # Restrict to valid markers (drop out-of-column outliers and bad tracks).
+        valid = self._valid()
+        Xv = self.X[valid]
         self.marker_span = float(np.nanmax(Xv)) if np.isfinite(Xv).any() else 0.0
         spacing = self._marker_spacing()
         margin = max(0.05 * self.column_length, 2.0 * spacing)
         # Does the tracked region cover (close to) the full column?
         self.coverage_ok = self.marker_span >= (self.column_length - margin)
 
-        collapsed_in = self.collapsed & incol
+        collapsed_in = self.collapsed & valid
         if not np.any(collapsed_in):
             self.prop_distance = 0.0
             self.arrested = None                # nothing collapsed: can't say
@@ -378,26 +380,30 @@ class PSTAnalyzer:
         self.prop_distance = max(0.0, front - self.critical_cut_length)
         self.front_position = front
 
-        # Evidence types (intact markers must also be inside the column):
-        intact_in = (~self.collapsed) & incol
+        # If the front sits past the column end, the scale/ROI is off, not the
+        # crack - the geometry can't be trusted, so don't claim arrest either way.
+        if self.scale_warning or front > self.column_length + margin:
+            self.arrested = None
+            self.arrest_X = None
+            return
+
+        # Evidence types (intact markers must also be valid and in the column):
+        intact_in = (~self.collapsed) & valid
         beyond_intact = bool(np.any(self.X[intact_in] > front + spacing))
         reached_column_end = front >= (self.column_length - margin)
-        reached_marker_edge = front >= (self.marker_span - max(spacing, 1e-9))
 
-        if beyond_intact:
-            # Directly observed: collapse stops while intact markers remain ahead.
-            self.arrested = True
-            self.arrest_X = front
-        elif reached_column_end:
+        if reached_column_end:
             # Propagated to (near) the actual column end.
             self.arrested = False
             self.arrest_X = None
-        elif reached_marker_edge and not self.coverage_ok:
-            # Crack reached the edge of the tracked region, but that edge is short
-            # of the column end - can't tell arrest from running out of ROI.
-            self.arrested = None
-            self.arrest_X = None
+        elif self.coverage_ok and beyond_intact:
+            # Full coverage and collapse stops while intact markers remain ahead:
+            # a real arrest, observed within the column.
+            self.arrested = True
+            self.arrest_X = front
         else:
+            # Incomplete coverage (front at the tracked edge, short of the column
+            # end): can't tell a real arrest from simply running out of ROI.
             self.arrested = None
             self.arrest_X = None
 
@@ -427,7 +433,7 @@ class PSTAnalyzer:
     # Reporting
     # ------------------------------------------------------------------ #
     def summary(self):
-        amp_c = self.amp[self.collapsed & self.in_column]
+        amp_c = self.amp[self.collapsed & self._valid()]
         return {
             "crack_speed_m_s": _round(self.speed, 2),
             "crack_speed_fit_r2": _round(self.speed_r2, 3),
@@ -444,6 +450,7 @@ class PSTAnalyzer:
             "roi_covers_column": bool(self.coverage_ok),
             "scale_warning": bool(self.scale_warning),
             "n_outliers_trimmed": int(self.n_outliers_trimmed),
+            "n_bad_tracks": int(self.bad_track.sum()),
             "arrested": self.arrested,                    # True / False / None (indeterminate)
             "arrest_position_m": _round(self.arrest_X, 3),
             "column_tilt_deg": _round(self.tilt_deg, 2),
@@ -466,6 +473,7 @@ class PSTAnalyzer:
             "collapsed": self.collapsed,
             "saw_excluded": self.saw_excluded,
             "in_column": self.in_column,
+            "bad_track": self.bad_track,
         }).sort_values("along_column_m").reset_index(drop=True)
 
     def _window_pad(self):
@@ -517,7 +525,7 @@ class PSTAnalyzer:
         """
         F = self.w.shape[0]
         f0, f1 = self._window_pad()
-        incol = np.where(self.in_column)[0]
+        incol = np.where(self._valid())[0]
         if incol.size == 0:
             return None
         xmin, xmax = self.X[incol].min(), self.X[incol].max()
@@ -567,10 +575,16 @@ class PSTAnalyzer:
                   f"near-simultaneous (the event spans only {win_frames} frames) - the front "
                   f"likely crossed the tracked region faster than the frame rate resolves. "
                   f"See the kymograph; a higher fps or a longer tracked span is needed for speed.")
-        if self.t_init is not None or self.cut_length_m is not None:
-            print(f"  -> saw-cut phase excluded up to {self.critical_cut_length:.2f} m "
+        if int(self.bad_track.sum()):
+            print(f"  -> excluded {int(self.bad_track.sum())} bad track(s) "
+                  f"(collapse far above local neighbours - optical flow lost lock)")
+        if self.critical_cut_length > 0:
+            print(f"  -> saw-cut length {self.critical_cut_length:.2f} m "
                   f"({int(self.saw_excluded.sum())} markers); speed/distance use the "
                   f"propagation phase only")
+        elif self.cut_length_m is None:
+            print(f"  note: saw-cut length auto-detected as 0 (slab may settle all at "
+                  f"once on camera); pass --cut-length-cm with the measured cut length.")
         if self.fps <= 60:
             print(f"  WARNING: fps is {self.fps:.0f}. PST crack propagation is fast "
                   f"(~10-40 m/s); pass --fps for high-speed footage (e.g. 240) or the "
@@ -606,7 +620,7 @@ class PSTAnalyzer:
         # 1) Collapse-vs-time curves, colored by along-column position so the
         #    left-to-right propagation delay is visible. Window shaded.
         fig, ax = plt.subplots(figsize=(8, 5))
-        idx = np.where(self.collapsed & self.in_column)[0]
+        idx = np.where(self.collapsed & self._valid())[0]
         if idx.size:
             order = idx[np.argsort(self.X[idx])]
             xmin, xmax = self.X[order].min(), self.X[order].max()
@@ -628,7 +642,7 @@ class PSTAnalyzer:
         # 1b) Kymograph: collapse over (along-column position, time) - the
         #     propagation front shows as a tilted edge; the window is marked.
         fig, ax = plt.subplots(figsize=(9, 5))
-        incol = self.in_column & np.isfinite(self.X)
+        incol = self._valid() & np.isfinite(self.X)
         if incol.sum() >= 2:
             nb = min(30, max(6, int(incol.sum())))
             Xi = self.X[incol]
@@ -675,10 +689,12 @@ class PSTAnalyzer:
 
         # 3) Collapse amplitude profile vs position (+ propagation distance / column end)
         fig, ax = plt.subplots(figsize=(8, 5))
-        ax.scatter(self.X[self.collapsed], self.amp[self.collapsed], s=25,
-                   c="tab:blue", label="collapsed")
-        if np.any(~self.collapsed):
-            ax.scatter(self.X[~self.collapsed], self.amp[~self.collapsed], s=18,
+        valid = self._valid()
+        coll = self.collapsed & valid
+        intact = (~self.collapsed) & valid
+        ax.scatter(self.X[coll], self.amp[coll], s=25, c="tab:blue", label="collapsed")
+        if np.any(intact):
+            ax.scatter(self.X[intact], self.amp[intact], s=18,
                        c="lightgray", label="not collapsed")
         ax.axvline(self.prop_distance, color="tab:green", ls="--",
                    label=f"propagation = {self.prop_distance:.2f} m")
@@ -698,11 +714,13 @@ class PSTAnalyzer:
             fig, ax = plt.subplots(figsize=(10, 6))
             ax.imshow(self.frame0[:, :, ::-1])      # BGR -> RGB
             x0, y0 = self.pos[0, :, 0], self.pos[0, :, 1]
+            valid = self._valid()
             cats = [
                 (~self.in_column, "red", "out of column (excluded)"),
-                (self.saw_excluded, "orange", "saw-cut (excluded)"),
-                (self.collapsed & self.in_column & ~self.saw_excluded, "lime", "propagation"),
-                (~self.collapsed & self.in_column & ~self.saw_excluded, "deepskyblue", "not collapsed"),
+                (self.bad_track, "magenta", "bad track (excluded)"),
+                (self.saw_excluded & valid, "orange", "saw-cut (excluded)"),
+                (self.collapsed & valid & ~self.saw_excluded, "lime", "propagation"),
+                (~self.collapsed & valid & ~self.saw_excluded, "deepskyblue", "not collapsed"),
             ]
             for m, color, label in cats:
                 if np.any(m):
