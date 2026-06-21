@@ -804,7 +804,11 @@ class VideoUtil:
         bg_p0 = None
         if stabilize:
             roi_dilated = cv2.dilate(mask_gray, np.ones((15, 15), np.uint8))
-            bg_mask = cv2.bitwise_not(roi_dilated)
+            if self.stab_mask is not None:
+                # User-drawn static zone(s); still exclude the tracked object.
+                bg_mask = cv2.bitwise_and(self.stab_mask, cv2.bitwise_not(roi_dilated))
+            else:
+                bg_mask = cv2.bitwise_not(roi_dilated)
             bg_p0 = cv2.goodFeaturesToTrack(prev_gray, mask=bg_mask, **bg_detect_params)
             if bg_p0 is None:
                 print("Warning: no background features; trajectories will not be camera-stabilized.")
@@ -850,6 +854,7 @@ class VideoUtil:
 
         return {
             'positions': pos,
+            'positions_raw': raw,   # raw pixel trajectories (for drawing on frames)
             'times': np.arange(n_frames) / float(self.fps),
             'pix_width': self.pix_width,
             'pix_height': self.pix_height,

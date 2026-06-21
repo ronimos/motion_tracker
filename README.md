@@ -193,6 +193,11 @@ python pst_analysis.py --path data/PST_01.mp4 --column-length-cm 200 --fps 240 \
 > the true capture rate or every time (and the crack speed) is wrong by the ratio.
 > The tool warns when the fps looks too low.
 
+For handheld footage, `--stabilize` removes camera motion. By default it uses
+everything outside the slab ROI as the static reference; for scenes with moving
+background (people, trees), restrict it to a known-still region with `--draw-static`
+(draw the zone interactively) or `--static-roi x,y,w,h`.
+
 It seeds points in the slab ROI (no physical markers required) and tracks them as
 stable trajectories via `VideoUtil.track_markers()`. Two seeding modes:
 
@@ -205,11 +210,21 @@ stable trajectories via `VideoUtil.track_markers()`. Two seeding modes:
   when the slab is marked with red paint fiducials; the markers land on the dots
   instead of on incidental corners.
 
-Outputs to `--out`: a summary (`*_summary.json`), a per-marker table
-(`*_markers.csv`), and diagnostic plots — `*_markers_overlay.png` (every seeded
-point drawn on the first frame, color-coded: propagation / not-collapsed /
-saw-cut / out-of-column, so you can **see and verify coverage**), plus
-collapse-vs-time, onset-vs-position with the speed fit, and the collapse profile.
+Outputs to `--out`:
+
+- `*_summary.json` — the metrics above.
+- `*_markers.csv` — per-marker table (position, collapse, onset, etc.).
+- `*_trajectories.csv` — **per-frame, per-marker movement**: each point's distance
+  from the cut end plus its along-column and collapse (normal) displacement in mm,
+  for every frame in the propagation window (`--full-trajectories` for the whole
+  record).
+- `*_event.mp4` — **annotated event video**: the markers drawn on the real frames
+  through the propagation window, **colored by along-column distance** and with
+  motion trails, so you can eyeball the propagation frame-by-frame.
+- Plots: `*_markers_overlay.png` (seeded points on the first frame, color-coded
+  propagation / not-collapsed / saw-cut / out-of-column — verify coverage),
+  `*_collapse_curves.png`, `*_kymograph.png`, `*_crack_speed.png`,
+  `*_collapse_profile.png`.
 
 **Geometry** (side-view camera): the column's long axis is fitted from the initial
 marker positions (PCA), so a tilted-in-frame column is handled — along-column
