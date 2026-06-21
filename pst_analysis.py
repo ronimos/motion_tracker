@@ -605,9 +605,10 @@ def build_parser():
     p.add_argument("--start", type=int, default=0, help="First frame to track.")
     p.add_argument("--end", type=int, default=None, help="Last frame to track (exclusive).")
     p.add_argument("--n-markers", type=int, default=200, help="Max markers to track in the ROI.")
-    p.add_argument("--seed", choices=["features", "grid"], default="features",
-                   help="Marker seeding: 'features' (corners) or 'grid' (regular grid, "
-                        "better for low-texture snow that yields few corners).")
+    p.add_argument("--seed", choices=["features", "grid", "color"], default="features",
+                   help="Marker seeding: 'features' (corners), 'grid' (regular grid, for "
+                        "low-texture snow), or 'color' (red paint-dot centroids, for a "
+                        "spray-marked slab).")
     p.add_argument("--grid-spacing-px", type=int, default=25,
                    help="Grid spacing in pixels when --seed grid.")
     p.add_argument("--quality", type=float, default=0.05,

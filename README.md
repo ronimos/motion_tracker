@@ -194,6 +194,9 @@ stable trajectories via `VideoUtil.track_markers()`. Two seeding modes:
 - `--seed grid` — a regular grid across the ROI (`--grid-spacing-px`). Use this for
   **low-texture snow**, where corner detection finds only a handful of points
   (you'll see a "low-texture" note if `features` mode returns few markers).
+- `--seed color` — centroids of **red spray-paint dots** within the ROI. Use this
+  when the slab is marked with red paint fiducials; the markers land on the dots
+  instead of on incidental corners.
 
 Outputs to `--out`: a summary (`*_summary.json`), a per-marker table
 (`*_markers.csv`), and diagnostic plots — `*_markers_overlay.png` (every seeded
