@@ -163,11 +163,19 @@ fracture-propagation metrics from the slab-marker trajectories:
   reported as the full along-column profile (amplitude per marker, in mm).
 - **Crack propagation speed** — from each marker's collapse-onset time vs its
   along-column position (linear fit; the van Herwijnen-style PTV approach).
-- **Propagation distance** — how far the crack travelled from the cut end, and
-  whether it **arrested** before reaching the far end of the column.
+- **Propagation distance** — how far the dynamic crack travelled (measured from the
+  critical cut length), and whether it **arrested** before the far end of the column.
 - **Touchdown distance** — the length over which the slab bends from the crack
   front down to re-contact the collapsed layer behind it (the bending zone),
   estimated as `crack_speed × marker rise-time`.
+
+The **saw-cut phase is detected and excluded**: during sawing, markers collapse
+slowly as the saw advances, then the remaining column collapses in a fast burst at
+crack initiation. The tool finds that transition as the knee in the cumulative
+collapse-onset curve (the critical cut length) and uses only the propagation phase
+for the speed, distance, and touchdown — so hand-sawing speed doesn't bias the
+crack speed. Override with `--cut-length-cm` (manual critical cut) or disable with
+`--no-exclude-saw`.
 
 ```bash
 # interactive ROI + scale calibration (OpenCV windows + console prompts)
@@ -197,6 +205,13 @@ coverage warning, since a crack reaching the edge of the ROI is indistinguishabl
 from one that kept going. Extend the ROI to span the full column for reliable arrest
 detection. Also inspect the crack-speed fit R²: a low value means no coherent
 propagation front (or the ROI/scale/cut direction need adjusting).
+
+**Scale / stray-feature guard.** Features tracked outside the column (saw, hand, pit
+wall) or a wrong scale show up as a tracked extent longer than `--column-length-cm`.
+A few such markers are trimmed (reported as `n_outliers_trimmed`); if many fall
+outside, it's treated as a likely scale error — the data is kept but `scale_warning`
+is set and a warning printed, because distances and speed can't be trusted until the
+calibration is fixed.
 
 ## Notes
 
