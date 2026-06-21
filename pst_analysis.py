@@ -39,6 +39,7 @@ import argparse
 
 import numpy as np
 import pandas as pd
+import cv2
 import matplotlib
 matplotlib.use("Agg")  # headless-safe: figures are written to disk, never shown
 import matplotlib.pyplot as plt
@@ -88,6 +89,8 @@ class PSTAnalyzer:
         self.frame0 = track.get('frame0')
         pos = np.asarray(track['positions'], dtype=float)       # (F, N, 2) px
         self.pos = pos
+        # raw (un-stabilized) pixel trajectories, for drawing on the actual frames
+        self.pos_raw = np.asarray(track.get('positions_raw', pos), dtype=float)
 
         self._build_per_marker()
         self._flag_outliers()           # scale / out-of-column features
@@ -465,7 +468,82 @@ class PSTAnalyzer:
             "in_column": self.in_column,
         }).sort_values("along_column_m").reset_index(drop=True)
 
-    def report(self, outdir="pst_results", prefix="pst"):
+    def _window_pad(self):
+        """Frame range [f0, f1) of the event window plus a small pad."""
+        F = self.w.shape[0]
+        pad = int(round(0.25 * (self.win1 - self.win0))) + 3
+        return max(0, self.win0 - pad), min(F, self.win1 + pad + 1)
+
+    def trajectory_table(self, window_only=True):
+        """
+        Per-frame, per-marker movement: along-column displacement and collapse
+        (normal-to-axis), both in mm, with each marker's distance from the cut end.
+        Restricted to the propagation window (+pad) unless window_only is False.
+        """
+        F = self.w.shape[0]
+        f0, f1 = self._window_pad() if window_only else (0, F)
+        Pm = self.pos.copy()
+        Pm[:, :, 0] *= self.sx
+        Pm[:, :, 1] *= self.sy
+        disp = Pm - Pm[0][None, :, :]
+        along = (disp @ self.axis) * 1000.0          # (F, N) mm along the column
+        rows = []
+        for i in range(self.amp.size):
+            if not self.in_column[i]:
+                continue
+            for f in range(f0, f1):
+                p = self.pos_raw[f, i]
+                if not np.isfinite(p).all():
+                    continue
+                rows.append((int(i), round(float(self.X[i]), 4), int(f),
+                             round(float(self.t[f]), 5),
+                             round(float(along[f, i]), 3), round(float(self.w[f, i]), 3)))
+        return pd.DataFrame(rows, columns=["marker", "along_column_m", "frame", "time_s",
+                                           "along_disp_mm", "collapse_mm"])
+
+    def _marker_bgr(self, i, xmin, xmax):
+        """BGR color for marker i from a colormap of its along-column distance."""
+        frac = (self.X[i] - xmin) / (xmax - xmin) if xmax > xmin else 0.5
+        r, g, b, _ = plt.get_cmap("turbo")(float(np.clip(frac, 0, 1)))
+        return int(b * 255), int(g * 255), int(r * 255)
+
+    def save_event_video(self, frames, outpath, fps_out=30, trail=8):
+        """
+        Write an MP4 of the propagation event: markers drawn on the real frames,
+        colored by along-column distance (colormap), with short motion trails.
+
+        `frames` must be the BGR buffer aligned with the tracked positions
+        (i.e. video_buffer[start:end]), shape (F, H, W, 3).
+        """
+        F = self.w.shape[0]
+        f0, f1 = self._window_pad()
+        incol = np.where(self.in_column)[0]
+        if incol.size == 0:
+            return None
+        xmin, xmax = self.X[incol].min(), self.X[incol].max()
+        h, w = frames.shape[1:3]
+        writer = cv2.VideoWriter(outpath, cv2.VideoWriter_fourcc(*"mp4v"),
+                                 fps_out, (w, h), isColor=True)
+        for f in range(f0, f1):
+            img = frames[f].copy()
+            for i in incol:
+                col = self._marker_bgr(i, xmin, xmax)
+                for tf in range(max(f0, f - trail), f):
+                    a, b = self.pos_raw[tf, i], self.pos_raw[tf + 1, i]
+                    if np.isfinite(a).all() and np.isfinite(b).all():
+                        cv2.line(img, (int(a[0]), int(a[1])), (int(b[0]), int(b[1])), col, 1)
+                p = self.pos_raw[f, i]
+                if np.isfinite(p).all():
+                    cv2.circle(img, (int(p[0]), int(p[1])), 4, col, -1)
+            in_win = self.win0 <= f <= self.win1
+            label = f"t={self.t[f]:.3f}s" + ("  [EVENT]" if in_win else "")
+            cv2.putText(img, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                        (0, 255, 255) if in_win else (255, 255, 255), 2)
+            writer.write(img)
+        writer.release()
+        return outpath
+
+    def report(self, outdir="pst_results", prefix="pst", full_trajectories=False):
         os.makedirs(outdir, exist_ok=True)
         summary = self.summary()
 
@@ -513,8 +591,12 @@ class PSTAnalyzer:
             json.dump(summary, fh, indent=2)
         table = self.per_marker_table()
         table.to_csv(os.path.join(outdir, f"{prefix}_markers.csv"), index=False)
+        traj = self.trajectory_table(window_only=not full_trajectories)
+        traj.to_csv(os.path.join(outdir, f"{prefix}_trajectories.csv"), index=False)
         self._plots(outdir, prefix)
-        print(f"\nWrote summary, per-marker CSV, and plots to: {outdir}/")
+        scope = "full record" if full_trajectories else "propagation window"
+        print(f"\nWrote summary, per-marker CSV, per-frame trajectories ({scope}), "
+              f"and plots to: {outdir}/")
         return summary
 
     # ------------------------------------------------------------------ #
@@ -671,6 +753,17 @@ def run(args):
         print("Calibrate scale: draw a rectangle of known size, then enter its size.")
         v.set_pxl_size()
 
+    # 2b) Static zone for camera-motion (noise) compensation
+    if args.stabilize:
+        if args.static_roi:
+            x, y, w, h = (int(s) for s in args.static_roi.split(","))
+            sm = np.zeros(v.video_buffer[0].shape[:2], dtype=np.uint8)
+            sm[y:y + h, x:x + w] = 255
+            v.stab_mask = sm
+        elif args.draw_static:
+            print("Draw the STATIC reference zone(s) for stabilization, then Esc.")
+            v.set_static_area()
+
     if args.fps:
         v.fps = args.fps
 
@@ -689,7 +782,15 @@ def run(args):
                            exclude_saw=not args.no_exclude_saw,
                            cut_length_m=(args.cut_length_cm / 100.0
                                          if args.cut_length_cm is not None else None))
-    analyzer.report(outdir=args.out, prefix=args.prefix)
+    analyzer.report(outdir=args.out, prefix=args.prefix,
+                    full_trajectories=args.full_trajectories)
+
+    # 5) Annotated event video (markers colored by along-column distance)
+    if not args.no_video:
+        frames = v.video_buffer[track['start']:track['end']]
+        out_mp4 = os.path.join(args.out, f"{args.prefix}_event.mp4")
+        if analyzer.save_event_video(frames, out_mp4, fps_out=args.video_fps):
+            print(f"Wrote annotated event video: {out_mp4}")
 
 
 def build_parser():
@@ -720,6 +821,18 @@ def build_parser():
     p.add_argument("--stabilize", action="store_true",
                    help="Camera-motion (noise) compensation from background features. "
                         "Use for handheld footage; needs good background outside the ROI.")
+    p.add_argument("--draw-static", action="store_true",
+                   help="With --stabilize, interactively draw the static reference zone(s) "
+                        "instead of using everything outside the ROI.")
+    p.add_argument("--static-roi", default=None,
+                   help="With --stabilize, static reference zone as 'x,y,w,h' in pixels.")
+    p.add_argument("--no-video", action="store_true",
+                   help="Skip the annotated event video.")
+    p.add_argument("--video-fps", type=float, default=30.0,
+                   help="Playback fps of the annotated event video.")
+    p.add_argument("--full-trajectories", action="store_true",
+                   help="Export per-frame trajectories for the whole record, not just "
+                        "the propagation window.")
     p.add_argument("--onset-frac", type=float, default=0.10,
                    help="Fraction of a marker's collapse used as the onset threshold.")
     p.add_argument("--min-collapse-mm", type=float, default=1.0,
