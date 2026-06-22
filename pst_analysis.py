@@ -132,16 +132,22 @@ class PSTAnalyzer:
         self.w = w
 
         # --- Dynamic propagation window (from collective collapse velocity) ---
-        # Isolates the fast collapse event from slow pre/post drift, so onset
-        # times reflect the crack front, not gradual settling.
+        # Locates the collapse event in time so onset/speed reflect the crack
+        # front, not gradual settling. Used for TIMING only: the magnitude of
+        # collapse is measured from the total settle (below), so a window that
+        # lands late (e.g. on a creep/noise velocity blip) can no longer shrink
+        # the reported collapse to nothing.
         self.win0, self.win1 = self._propagation_window(w)
 
-        # Amplitude = collapse during the event: plateau just after the window
-        # minus the baseline just before it (ignores slow drift outside the event).
-        pre = w[:max(1, self.win0)]
-        post = w[self.win1:] if self.win1 < F - 1 else w[-max(1, int(0.02 * F)):]
-        baseline = np.nanmedian(pre, axis=0)
-        plateau = np.nanmedian(post, axis=0)
+        # Collapse magnitude (mm) = total settle: the final settled position minus
+        # the initial (pre-collapse) position, each a robust median over a chunk of
+        # the clip ends. This captures the full drop whether the slab collapses in
+        # one fast step or keeps settling, and does not depend on where the window
+        # landed - the previous plateau-just-after minus baseline-just-before the
+        # window read ~1 mm when the window mis-located, hiding a real ~7 mm drop.
+        k_end = max(3, int(round(0.03 * F)))
+        baseline = np.nanmedian(w[:k_end], axis=0)          # initial position
+        plateau = np.nanmedian(w[-k_end:], axis=0)          # settled position
         amp = plateau - baseline
         amp = np.where(np.isfinite(amp), amp, 0.0)
 
@@ -149,16 +155,24 @@ class PSTAnalyzer:
         touchdown = np.full(N, np.nan)
         collapsed = amp >= self.min_collapse_mm
 
-        # Search onset/touchdown only within the event window (plus a small pad),
-        # relative to each marker's own pre-event baseline.
+        # Onset/touchdown TIMING: cross times of each marker's own rise, searched
+        # only within the event window (plus a small pad) so slow pre/post drift
+        # can't set a false onset. The crossing levels are fractions of the rise
+        # *within the window* (evt_amp), not of the total settle, so a marker that
+        # keeps creeping after the event still has a well-defined onset/touchdown
+        # inside it.
         pad = int(round(0.25 * (self.win1 - self.win0))) + 2
         lo, hi = max(0, self.win0 - pad), min(F, self.win1 + pad + 1)
+        evt_base = np.nanmedian(w[lo:self.win0 + 1], axis=0)
+        evt_plateau = (np.nanmedian(w[self.win1:hi], axis=0)
+                       if self.win1 < hi else w[min(self.win1, F - 1)])
+        evt_amp = evt_plateau - evt_base
         for i in range(N):
-            if not collapsed[i]:
+            if not collapsed[i] or not (evt_amp[i] > 0):
                 continue
             wi = w[:, i]
-            onset[i] = self._cross_time(wi, baseline[i] + self.onset_frac * amp[i], lo, hi)
-            touchdown[i] = self._cross_time(wi, baseline[i] + self.touchdown_frac * amp[i], lo, hi)
+            onset[i] = self._cross_time(wi, evt_base[i] + self.onset_frac * evt_amp[i], lo, hi)
+            touchdown[i] = self._cross_time(wi, evt_base[i] + self.touchdown_frac * evt_amp[i], lo, hi)
 
         self.baseline = baseline
         self.amp = amp
@@ -172,8 +186,12 @@ class PSTAnalyzer:
         Frame window [f0, f1] of the dynamic collapse event.
 
         Found from the collective downward-collapse velocity (median |dw/dt| across
-        markers), smoothed, then expanded around its peak down to 25% of the peak.
-        Robust to slow pre/post drift that fools a cumulative-displacement window.
+        markers), smoothed. We take the *earliest* peak that is a strong fraction of
+        the global maximum, not the global maximum itself: the slab often keeps
+        creeping (or the camera jitters) long after it has collapsed, and that late
+        motion can produce the single largest velocity blip. Locking onto it would
+        place the window after the collapse, so onset/speed would miss the real
+        front. Robust to slow pre/post drift that fools a cumulative window.
         """
         F = w.shape[0]
         vy = np.abs(np.gradient(np.nan_to_num(w, nan=0.0), axis=0))   # mm/frame
@@ -183,11 +201,23 @@ class PSTAnalyzer:
             k += 1
         coll = np.convolve(coll, np.ones(k) / k, mode='same')
         self._coll_vel = coll
-        peak = int(np.nanargmax(coll))
-        pv = coll[peak]
+        pv = float(np.nanmax(coll)) if coll.size else 0.0
         if not np.isfinite(pv) or pv <= 0:
             return 0, F - 1
-        thr = 0.25 * pv
+        # First frame of the earliest run that reaches 60% of the global peak -
+        # i.e. the first genuine collapse, even if a later blip is larger.
+        strong = coll >= 0.60 * pv
+        starts = np.where(strong & ~np.r_[False, strong[:-1]])[0]
+        if starts.size:
+            run0 = int(starts[0])
+            run1 = run0
+            while run1 < F - 1 and strong[run1 + 1]:
+                run1 += 1
+            peak = run0 + int(np.nanargmax(coll[run0:run1 + 1]))
+        else:
+            peak = int(np.nanargmax(coll))
+        # Expand around that peak down to 25% of ITS height.
+        thr = 0.25 * coll[peak]
         f0 = peak
         while f0 > 0 and coll[f0 - 1] > thr:
             f0 -= 1
@@ -225,27 +255,44 @@ class PSTAnalyzer:
 
     def _flag_bad_tracks(self):
         """
-        Flag markers whose collapse is wildly larger than their neighbours' - the
-        signature of an optical-flow track that lost lock and jumped (e.g. a 72 mm
-        "collapse" in a region where the slab settled ~2 mm). Compared against
-        *local* neighbours so a genuine spatial trend in collapse isn't flagged.
-        Flagged markers are excluded from the collapse stats, the speed fit, and
-        the propagation front.
+        Flag collapsed markers whose collapse amplitude is a lost optical-flow
+        track (e.g. a 426 mm "collapse" where the slab actually settled ~8 mm).
+        Two complementary, scale-free tests - no absolute cutoff, so a video with
+        genuinely large but *uniform* collapse isn't filtered:
+
+        1. GLOBAL: amplitude far above the robust spread of all collapsed markers.
+           This catches a *cluster* of lost tracks (common at the disturbed cut end
+           / under stabilization), which a local-only test misses because the
+           outliers sit next to each other and validate one another.
+        2. LOCAL: amplitude far above immediate neighbours - catches an isolated
+           jump inside a genuine spatial collapse trend, where the global spread is
+           wide enough to hide it.
+
+        Amplitude is a robust median of the clip ends, so a transient single-frame
+        blip that recovers does not flag a marker. Flagged markers are excluded from
+        the collapse stats, the speed fit, the propagation front, and every plot.
         """
         self.bad_track = np.zeros(self.amp.size, dtype=bool)
-        m = self.collapsed & self.in_column
-        idx = np.where(m)[0]
+        idx = np.where(self.collapsed & self.in_column)[0]
         if idx.size < 5:
             return
+        a = self.amp
+        # (1) Global robust outlier (median absolute deviation of the whole set).
+        gmed = np.median(a[idx])
+        gmad = np.median(np.abs(a[idx] - gmed)) + 1e-9
+        glob = (a > gmed + 12.0 * gmad) & (a > 4.0 * gmed)
+        # (2) Local outlier vs nearby markers along the column.
         win = max(0.15, 3.0 * self._marker_spacing())
         for i in idx:
+            if glob[i]:
+                self.bad_track[i] = True
+                continue
             neigh = idx[(np.abs(self.X[idx] - self.X[i]) <= win) & (idx != i)]
             if neigh.size < 3:
                 neigh = idx[idx != i]
-            med = np.median(self.amp[neigh])
-            mad = np.median(np.abs(self.amp[neigh] - med)) + 1e-9
-            # Far above local neighbours by every measure -> a tracking failure.
-            if self.amp[i] > med + 8.0 * mad and self.amp[i] > 3.0 * med and self.amp[i] > 5.0:
+            med = np.median(a[neigh])
+            mad = np.median(np.abs(a[neigh] - med)) + 1e-9
+            if a[i] > med + 8.0 * mad and a[i] > 3.0 * med:
                 self.bad_track[i] = True
 
     def _valid(self):
@@ -460,7 +507,29 @@ class PSTAnalyzer:
             "collapse_max_mm": _round(float(np.max(amp_c)) if amp_c.size else np.nan, 2),
             "n_markers_total": int(self.amp.size),
             "n_markers_collapsed": int((self.collapsed & self.in_column).sum()),
+            "collapse_net_negative": self._collapse_inverted()[0],
         }
+
+    def _collapse_inverted(self):
+        """Detect a net-UPWARD "collapse" over the event.
+
+        A settling slab can only move downward, so a population of markers whose
+        event amplitude is net-negative is physically impossible - it signals an
+        inverted axis normal or (far more often) camera-motion stabilization that
+        removed and inverted the real downward collapse. This is what turns a real
+        collapse into "0 markers collapsed".
+
+        Returns (is_inverted, n_up, n_down, frac_up) over valid in-column markers,
+        where up/down count markers past +/- min_collapse_mm.
+        """
+        valid = self._valid()
+        n = int(valid.sum())
+        thr = self.min_collapse_mm
+        n_down = int((valid & (self.amp >= thr)).sum())
+        n_up = int((valid & (self.amp <= -thr)).sum())
+        frac_up = (n_up / n) if n else 0.0
+        inverted = bool(n and frac_up >= 0.30 and n_up > n_down)
+        return inverted, n_up, n_down, frac_up
 
     def per_marker_table(self):
         return pd.DataFrame({
@@ -523,7 +592,6 @@ class PSTAnalyzer:
         `frames` must be the BGR buffer aligned with the tracked positions
         (i.e. video_buffer[start:end]), shape (F, H, W, 3).
         """
-        F = self.w.shape[0]
         f0, f1 = self._window_pad()
         incol = np.where(self._valid())[0]
         if incol.size == 0:
@@ -575,6 +643,15 @@ class PSTAnalyzer:
                   f"near-simultaneous (the event spans only {win_frames} frames) - the front "
                   f"likely crossed the tracked region faster than the frame rate resolves. "
                   f"See the kymograph; a higher fps or a longer tracked span is needed for speed.")
+        inverted, n_up, n_down, _ = self._collapse_inverted()
+        if inverted:
+            print(f"  WARNING: collapse is net-NEGATIVE - {n_up} of "
+                  f"{int(self._valid().sum())} markers moved UP during the event "
+                  f"(only {n_down} settled down). A slab can only settle downward, so "
+                  f"this is not real collapse: the camera-motion stabilization is "
+                  f"removing/inverting it (drop --stabilize, or draw AND commit a "
+                  f"static zone with 'a'/Enter), or the column-axis normal is flipped. "
+                  f"Collapse stats below are unreliable until this is fixed.")
         if int(self.bad_track.sum()):
             print(f"  -> excluded {int(self.bad_track.sum())} bad track(s) "
                   f"(collapse far above local neighbours - optical flow lost lock)")
@@ -582,6 +659,15 @@ class PSTAnalyzer:
             print(f"  -> saw-cut length {self.critical_cut_length:.2f} m "
                   f"({int(self.saw_excluded.sum())} markers); speed/distance use the "
                   f"propagation phase only")
+            # Guard: a cut length past where collapse actually is removes every
+            # propagation marker, leaving nothing for the speed fit.
+            cv = self.collapsed & self._valid()
+            remaining = int((cv & ~self.saw_excluded).sum())
+            if cv.sum() and remaining < 3:
+                print(f"  WARNING: the saw-cut length {self.critical_cut_length:.2f} m covers "
+                      f"almost all collapsed markers (only {remaining} left past it). Likely the "
+                      f"--cut-length-cm is too large, the --cut-from end is wrong, or the scale "
+                      f"is off (collapse spans X={self.X[cv].min():.2f}-{self.X[cv].max():.2f} m).")
         elif self.cut_length_m is None:
             print(f"  note: saw-cut length auto-detected as 0 (slab may settle all at "
                   f"once on camera); pass --cut-length-cm with the measured cut length.")
@@ -753,6 +839,58 @@ def _set_roi_from_arg(v, roi):
     v.mask = mask
 
 
+def _mask_bbox(mask_gray):
+    """Bounding box [x, y, w, h] of the nonzero region, or None."""
+    ys, xs = np.where(mask_gray > 0)
+    if xs.size == 0:
+        return None
+    return [int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)]
+
+
+def _rects_from_mask(mask):
+    """Bounding boxes [x, y, w, h] of each connected region in a binary mask."""
+    n, _, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8))
+    return [[int(stats[i, 0]), int(stats[i, 1]), int(stats[i, 2]), int(stats[i, 3])]
+            for i in range(1, n)]
+
+
+def save_config(v, path):
+    """Save the ROI, pixel scale, and static zone(s) so a re-run can skip the
+    interactive setup. Stored as rectangles + pixel sizes (human-editable JSON)."""
+    roi_gray = cv2.cvtColor(v.mask, cv2.COLOR_BGR2GRAY)
+    cfg = {
+        "video": os.path.basename(v.video_file),
+        "pix_width_m_per_px": float(v.pix_width),
+        "pix_height_m_per_px": float(v.pix_height),
+        "roi_xywh": _mask_bbox(roi_gray),
+        "static_zones_xywh": _rects_from_mask(v.stab_mask) if v.stab_mask is not None else [],
+    }
+    with open(path, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+    return cfg
+
+
+def load_config(v, path):
+    """Apply a saved config to a VideoUtil: ROI mask, pixel scale, static zone(s)."""
+    with open(path) as fh:
+        cfg = json.load(fh)
+    v.pix_width = float(cfg["pix_width_m_per_px"])
+    v.pix_height = float(cfg["pix_height_m_per_px"])
+    roi = cfg.get("roi_xywh")
+    if roi:
+        x, y, w, h = roi
+        mask = np.zeros_like(v.video_buffer[0])
+        mask[y:y + h, x:x + w] = 255
+        v.mask = mask
+    zones = cfg.get("static_zones_xywh") or []
+    if zones:
+        sm = np.zeros(v.video_buffer[0].shape[:2], dtype=np.uint8)
+        for x, y, w, h in zones:
+            sm[y:y + h, x:x + w] = 255
+        v.stab_mask = sm
+    return cfg
+
+
 def run(args):
     v = VideoUtil(args.path, interactive=False)
 
@@ -761,32 +899,46 @@ def run(args):
     video_stem = os.path.splitext(os.path.basename(args.path))[0]
     outdir = os.path.join(args.out, video_stem)
     prefix = args.prefix if args.prefix else video_stem
+    config_path = os.path.join(outdir, f"{prefix}_config.json")
+    load_path = args.config or (config_path if args.reuse else None)
 
-    # 1) Region of interest = the slab (where markers/features live)
-    if args.roi:
-        _set_roi_from_arg(v, args.roi)
+    if load_path and os.path.exists(load_path):
+        # Reuse a saved setup - no interactive ROI/scale/static steps.
+        cfg = load_config(v, load_path)
+        print(f"Loaded ROI/scale/static from {load_path}: "
+              f"scale {cfg['pix_width_m_per_px'] * 1000:.3f} mm/px, "
+              f"{len(cfg.get('static_zones_xywh') or [])} static zone(s)")
     else:
-        print("Draw a box around the slab markers (the part that collapses), then Esc.")
-        v.set_roi()
+        # 1) Region of interest = the slab (where markers/features live)
+        if args.roi:
+            _set_roi_from_arg(v, args.roi)
+        else:
+            print("Draw a box around the slab markers (the part that collapses), then Esc.")
+            v.set_roi()
 
-    # 2) Spatial scale
-    if args.mm_per_px:
-        v.pix_width = v.pix_height = args.mm_per_px / 1000.0
-        print(f"Scale set: {args.mm_per_px} mm/px")
-    else:
-        print("Calibrate scale: draw a rectangle of known size, then enter its size.")
-        v.set_pxl_size()
+        # 2) Spatial scale
+        if args.mm_per_px:
+            v.pix_width = v.pix_height = args.mm_per_px / 1000.0
+            print(f"Scale set: {args.mm_per_px} mm/px")
+        else:
+            print("Calibrate scale: draw a rectangle of known size, then enter its size.")
+            v.set_pxl_size()
 
-    # 2b) Static zone for camera-motion (noise) compensation
-    if args.stabilize:
-        if args.static_roi:
-            x, y, w, h = (int(s) for s in args.static_roi.split(","))
-            sm = np.zeros(v.video_buffer[0].shape[:2], dtype=np.uint8)
-            sm[y:y + h, x:x + w] = 255
-            v.stab_mask = sm
-        elif args.draw_static:
-            print("Draw the STATIC reference zone(s) for stabilization, then Esc.")
-            v.set_static_area()
+        # 2b) Static zone for camera-motion (noise) compensation
+        if args.stabilize:
+            if args.static_roi:
+                x, y, w, h = (int(s) for s in args.static_roi.split(","))
+                sm = np.zeros(v.video_buffer[0].shape[:2], dtype=np.uint8)
+                sm[y:y + h, x:x + w] = 255
+                v.stab_mask = sm
+            elif args.draw_static:
+                print("Draw the STATIC reference zone(s) for stabilization, then Esc.")
+                v.set_static_area()
+
+        # Save the setup so the next run can reuse it with --reuse / --config.
+        os.makedirs(outdir, exist_ok=True)
+        save_config(v, config_path)
+        print(f"Saved ROI/scale/static to {config_path} (re-run with --reuse to skip setup)")
 
     if args.fps:
         v.fps = args.fps
@@ -828,6 +980,11 @@ def build_parser():
                    help="Spatial scale in mm/pixel. If omitted, calibrate interactively.")
     p.add_argument("--roi", default=None,
                    help="Slab ROI as 'x,y,w,h' in pixels. If omitted, draw it interactively.")
+    p.add_argument("--reuse", action="store_true",
+                   help="Reuse the saved ROI/scale/static config for this video (skip the "
+                        "interactive setup). The config is auto-saved on the first run.")
+    p.add_argument("--config", default=None,
+                   help="Path to a saved config JSON to load (ROI/scale/static).")
     p.add_argument("--fps", type=float, default=None, help="Override video fps.")
     p.add_argument("--start", type=int, default=0, help="First frame to track.")
     p.add_argument("--end", type=int, default=None, help="Last frame to track (exclusive).")

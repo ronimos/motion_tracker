@@ -198,7 +198,17 @@ python pst_analysis.py --path data/PST_01.mp4 --column-length-cm 200 \
 # non-interactive scale and fixed ROI, handheld (camera stabilization):
 python pst_analysis.py --path data/PST_01.mp4 --column-length-cm 200 --fps 240 \
     --mm-per-px 0.8 --roi 200,150,1400,400 --stabilize --out pst_results
+
+# re-analyze the same clip without re-drawing the ROI / re-calibrating:
+python pst_analysis.py --path data/PST_01.mp4 --column-length-cm 200 --fps 240 \
+    --seed color --reuse --cut-length-cm 30
 ```
+
+**Reusing setup.** The interactive ROI, scale calibration, and static zone are
+auto-saved to `<out>/<video>/<video>_config.json` (rectangles + pixel sizes,
+human-editable). Re-run with **`--reuse`** to load them and skip those steps — handy
+for re-analyzing with different parameters (`--cut-length-cm`, `--seed`, …) without
+redrawing anything. Use `--config PATH` to load a specific config file.
 
 > **Frame rate matters.** PST crack propagation is fast (~10–40 m/s), so high-speed
 > footage (≥120–240 fps) is needed to resolve the front. Many cameras write the
@@ -241,6 +251,9 @@ etc. The files:
   propagation / not-collapsed / saw-cut / out-of-column — verify coverage),
   `*_collapse_curves.png`, `*_kymograph.png`, `*_crack_speed.png`,
   `*_collapse_profile.png`.
+
+See **[docs/pst_outputs.md](docs/pst_outputs.md)** for how to read each output image
+(with examples) and a checklist for a trustworthy result.
 
 **Geometry** (side-view camera): the column's long axis is fitted from the initial
 marker positions (PCA), so a tilted-in-frame column is handled — along-column
