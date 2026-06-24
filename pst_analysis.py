@@ -795,6 +795,11 @@ class PSTAnalyzer:
         fig.tight_layout(); fig.savefig(os.path.join(outdir, f"{prefix}_collapse_profile.png"), dpi=130)
         plt.close(fig)
 
+        # 3b) Collapse profile as a connecting LINE vs distance, with the saw-cut
+        #     region distinguished. Two variants (keep saw-cut in a separate color
+        #     / omit it) are written so we can compare and pick one later.
+        self._collapse_line_plot(outdir, prefix)
+
         # 4) Marker overlay on the first frame (where the points are tracked)
         if self.frame0 is not None:
             fig, ax = plt.subplots(figsize=(10, 6))
@@ -817,6 +822,92 @@ class PSTAnalyzer:
             ax.axis("off")
             fig.tight_layout(); fig.savefig(os.path.join(outdir, f"{prefix}_markers_overlay.png"), dpi=130)
             plt.close(fig)
+
+    def _collapse_line_plot(self, outdir, prefix):
+        """Collapse magnitude (mm) vs along-column distance (m) as a connecting
+        line - the slab's collapse profile.
+
+        The connecting line is a binned median of the *collapsed* markers only
+        (so it tracks where the slab actually dropped and isn't pulled to zero by
+        intact markers), while every marker is still drawn as a faint scatter -
+        collapsed in the region color, not-collapsed in gray - so the spatial
+        extent of the non-collapsing slab stays visible. Two variants are written:
+
+          *_collapse_line.png            - the whole column, with the saw-cut
+                                           region (X <= critical cut) as a separate
+                                           orange line, so saw-cut settling and the
+                                           crack collapse appear together.
+          *_collapse_line_no_sawcut.png  - saw-cut markers omitted entirely.
+
+        (Both are kept for now so we can decide which reads better.)
+        """
+        valid = self._valid()
+        X, A = self.X[valid], self.amp[valid]
+        saw = self.saw_excluded[valid]
+        coll = self.collapsed[valid]
+        if X.size < 2:
+            return
+
+        def binned(xs, ys):
+            if xs.size < 2:
+                return xs, ys
+            nb = int(min(25, max(5, xs.size // 4)))
+            edges = np.linspace(xs.min(), xs.max(), nb + 1)
+            bid = np.clip(np.digitize(xs, edges) - 1, 0, nb - 1)
+            bx, by = [], []
+            for b in range(nb):
+                sel = bid == b
+                if sel.any():
+                    bx.append(0.5 * (edges[b] + edges[b + 1]))
+                    by.append(np.median(ys[sel]))
+            return np.array(bx), np.array(by)
+
+        def draw_group(ax, m, color, line_kw, scatter_label=None):
+            """Faint scatter of all markers in mask m (collapsed in `color`,
+            not-collapsed in gray) plus a binned-median line of the collapsed ones."""
+            mc, mi = m & coll, m & ~coll
+            if np.any(mi):
+                ax.scatter(X[mi], A[mi], s=12, c="lightgray", alpha=0.6,
+                           label="not collapsed" if scatter_label else None)
+            if np.any(mc):
+                ax.scatter(X[mc], A[mc], s=12, c=color, alpha=0.30)
+                bx, by = binned(X[mc], A[mc])
+                ax.plot(bx, by, lw=2, ms=4, color=color, **line_kw)
+
+        cut = self.critical_cut_length
+        prop = ~saw
+
+        # Variant 1: full column, saw-cut region in a separate color.
+        fig, ax = plt.subplots(figsize=(8, 5))
+        draw_group(ax, prop, "tab:blue", dict(marker="o", label="collapse (propagation)"),
+                   scatter_label=True)
+        if np.any(saw):
+            draw_group(ax, saw, "tab:orange", dict(marker="s", label="saw-cut region"))
+        if cut > 0:
+            ax.axvline(cut, color="tab:purple", ls="-.", label=f"critical cut = {cut:.2f} m")
+        ax.axvline(self.column_length, color="k", ls=":",
+                   label=f"column end = {self.column_length:.2f} m")
+        ax.set_xlabel("along-column distance (m)")
+        ax.set_ylabel("collapse magnitude (mm)")
+        ax.set_title("Collapse profile along the column")
+        ax.legend(); ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, f"{prefix}_collapse_line.png"), dpi=130)
+        plt.close(fig)
+
+        # Variant 2: saw-cut markers omitted entirely.
+        fig, ax = plt.subplots(figsize=(8, 5))
+        draw_group(ax, prop, "tab:blue", dict(marker="o", label="collapse"),
+                   scatter_label=True)
+        ax.axvline(self.column_length, color="k", ls=":",
+                   label=f"column end = {self.column_length:.2f} m")
+        ax.set_xlabel("along-column distance (m)")
+        ax.set_ylabel("collapse magnitude (mm)")
+        ax.set_title("Collapse profile along the column (saw-cut omitted)")
+        ax.legend(); ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, f"{prefix}_collapse_line_no_sawcut.png"), dpi=130)
+        plt.close(fig)
 
 
 def _round(v, n):

@@ -252,7 +252,7 @@ etc. The files:
   `*_collapse_curves.png`, `*_kymograph.png`, `*_crack_speed.png`,
   `*_collapse_profile.png`.
 
-See **[docs/pst_outputs.md](docs/pst_outputs.md)** for how to read each output image
+See **[docs/pst_output_description.md](docs/pst_output_description.md)** for how to read each output image
 (with examples) and a checklist for a trustworthy result.
 
 **Geometry** (side-view camera): the column's long axis is fitted from the initial
