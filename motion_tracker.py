@@ -374,6 +374,71 @@ class VideoUtil:
         print(f"Calibration set: 1 pixel = {self.pix_width:.4f}m (width), {self.pix_height:.4f}m (height)")
 
 
+    def set_scale_from_length(self, length_m):
+        """Calibrate mm/px from a known real length (e.g. the PST column length).
+
+        The user drags a line between the two ends of the object of known length;
+        the scale is that length divided by the straight-line (Euclidean) pixel
+        distance between the endpoints. Because it uses the distance between the
+        two real ends, the result is independent of how the object is tilted in
+        the frame - no rotation needed and no knowledge of the tilt angle. Sets
+        a single isotropic scale (pix_width == pix_height), i.e. assumes square
+        pixels, which holds for essentially all video.
+
+        Controls: drag from one end to the other, 'r' to redo, '-' to zoom out,
+        Esc to save.
+        """
+        pts = []
+        zoom = 1
+        self.drawing = False
+        window_name = (f'Drag a line across the {length_m:.2f} m reference '
+                       f'(both ends) | r redo | - zoom | Esc save')
+
+        def on_line(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.ix, self.iy = x, y
+                self.drawing = True
+            elif event == cv2.EVENT_MOUSEMOVE and self.drawing:
+                self.img_cp = self.img.copy()
+                cv2.line(self.img_cp, (self.ix, self.iy), (x, y), (0, 255, 0), 2)
+            elif event == cv2.EVENT_LBUTTONUP and self.drawing:
+                self.drawing = False
+                pts[:] = [(self.ix, self.iy), (x, y)]
+                self.img_cp = self.img.copy()
+                cv2.line(self.img_cp, pts[0], pts[1], (0, 255, 0), 2)
+
+        self.img = self.video_buffer[0].copy()
+        self.img_cp = self.img.copy()
+        cv2.namedWindow(window_name)
+        cv2.setMouseCallback(window_name, on_line)
+        while True:
+            cv2.imshow(window_name, self.img_cp)
+            k = cv2.waitKey(20) & 0xFF
+            if k == 27:  # Esc: save
+                break
+            if k == ord('r'):  # redo
+                pts.clear()
+                self.img = self.video_buffer[0].copy()
+                self.img_cp = self.img.copy()
+            elif k == ord('-'):  # zoom out
+                self.img = cv2.resize(self.img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+                self.img_cp = self.img.copy()
+                zoom *= 2
+        cv2.destroyAllWindows()
+
+        if len(pts) != 2:
+            print("No reference line drawn; scale unchanged.")
+            return
+        (x1, y1), (x2, y2) = pts
+        dist_px = float(np.hypot(x2 - x1, y2 - y1)) * zoom
+        if dist_px < 1:
+            print("Reference line too short; scale unchanged.")
+            return
+        self.pix_width = self.pix_height = float(length_m) / dist_px
+        print(f"Scale from {length_m:.2f} m reference: {self.pix_width * 1000:.4f} mm/px "
+              f"({dist_px:.1f} px across the reference)")
+
+
     @staticmethod
     def _apply_affine(M, x, y):
         """Maps point (x, y) through a 2x3 affine transform M."""

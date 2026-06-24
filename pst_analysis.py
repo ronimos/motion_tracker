@@ -982,7 +982,50 @@ def load_config(v, path):
     return cfg
 
 
+def load_meta(args):
+    """Fill CLI args left unset (fps, saw-cut length, column length, cut-from) from a
+    per-video metadata registry, so per-experiment facts live in one place instead of
+    being re-typed for every run. Explicit CLI flags always take precedence.
+
+    The registry is JSON keyed by video name:
+        {"<video stem>": {"saw_cut_cm", "fps", "column_length_cm", "cut_from", ...}}
+    Path is --meta, else "saw_cut.json" alongside the video. ROI/scale/static stay in
+    the per-video config (they can have variants and are machine-generated).
+    """
+    path = args.meta or os.path.join(os.path.dirname(args.path) or ".", "saw_cut.json")
+    if not os.path.exists(path):
+        return
+    with open(path) as fh:
+        reg = json.load(fh)
+    stem = os.path.splitext(os.path.basename(args.path))[0]
+    m = reg.get(stem)
+    if not m:
+        print(f"Note: no metadata entry for '{stem}' in {path}.")
+        return
+    filled = {}
+    if args.fps is None and m.get("fps") is not None:
+        args.fps = float(m["fps"]); filled["fps"] = args.fps
+    if args.cut_length_cm is None and m.get("saw_cut_cm") is not None:
+        args.cut_length_cm = float(m["saw_cut_cm"]); filled["cut_length_cm"] = args.cut_length_cm
+    if args.column_length_cm is None and m.get("column_length_cm") is not None:
+        args.column_length_cm = float(m["column_length_cm"]); filled["column_length_cm"] = args.column_length_cm
+    if args.cut_from is None and m.get("cut_from"):
+        args.cut_from = m["cut_from"]; filled["cut_from"] = args.cut_from
+    if filled:
+        print(f"Loaded metadata for '{stem}' from {path}: "
+              + ", ".join(f"{k}={v}" for k, v in filled.items()))
+
+
 def run(args):
+    # Per-experiment defaults (saw cut, fps, column length, cut-from) from the
+    # metadata registry; explicit CLI flags already on `args` win.
+    load_meta(args)
+    if args.cut_from is None:
+        args.cut_from = "left"
+    if args.column_length_cm is None:
+        raise SystemExit("error: column length is required - pass --column-length-cm, or "
+                         "add column_length_cm to this video's entry in the metadata file.")
+
     v = VideoUtil(args.path, interactive=False)
 
     # Results go in a per-video subdirectory (named after the clip) so runs on
@@ -1011,6 +1054,10 @@ def run(args):
         if args.mm_per_px:
             v.pix_width = v.pix_height = args.mm_per_px / 1000.0
             print(f"Scale set: {args.mm_per_px} mm/px")
+        elif args.scale_from_column:
+            print(f"Calibrate scale: drag a line across the {args.column_length_cm:.0f} cm "
+                  f"column (end to end). Tilt doesn't matter.")
+            v.set_scale_from_length(args.column_length_cm / 100.0)
         else:
             print("Calibrate scale: draw a rectangle of known size, then enter its size.")
             v.set_pxl_size()
@@ -1063,12 +1110,22 @@ def run(args):
 def build_parser():
     p = argparse.ArgumentParser(description="PST fracture-propagation analysis from video.")
     p.add_argument("-v", "--path", required=True, help="Path to the PST video file.")
-    p.add_argument("--column-length-cm", type=float, required=True,
-                   help="Isolated column length in cm (used to judge arrest).")
-    p.add_argument("--cut-from", choices=["left", "right"], default="left",
-                   help="Which image end the saw cut starts from (along-column origin).")
+    p.add_argument("--meta", default=None,
+                   help="Per-video metadata registry JSON (saw cut, fps, column length, "
+                        "cut-from), keyed by video name. Defaults to 'saw_cut.json' next "
+                        "to the video. Supplies any of those values not given on the CLI.")
+    p.add_argument("--column-length-cm", type=float, default=None,
+                   help="Isolated column length in cm (used to judge arrest). Required "
+                        "unless supplied by the metadata file.")
+    p.add_argument("--cut-from", choices=["left", "right"], default=None,
+                   help="Which image end the saw cut starts from (along-column origin). "
+                        "From the metadata file if unset, else 'left'.")
     p.add_argument("--mm-per-px", type=float, default=None,
                    help="Spatial scale in mm/pixel. If omitted, calibrate interactively.")
+    p.add_argument("--scale-from-column", action="store_true",
+                   help="Derive mm/px from the known column length: click the two column "
+                        "ends (tilt-independent), instead of the rectangle calibration. "
+                        "Uses --column-length-cm / the metadata file.")
     p.add_argument("--roi", default=None,
                    help="Slab ROI as 'x,y,w,h' in pixels. If omitted, draw it interactively.")
     p.add_argument("--reuse", action="store_true",
@@ -1076,7 +1133,8 @@ def build_parser():
                         "interactive setup). The config is auto-saved on the first run.")
     p.add_argument("--config", default=None,
                    help="Path to a saved config JSON to load (ROI/scale/static).")
-    p.add_argument("--fps", type=float, default=None, help="Override video fps.")
+    p.add_argument("--fps", type=float, default=None,
+                   help="Override video fps. From the metadata file if unset.")
     p.add_argument("--start", type=int, default=0, help="First frame to track.")
     p.add_argument("--end", type=int, default=None, help="Last frame to track (exclusive).")
     p.add_argument("--n-markers", type=int, default=200, help="Max markers to track in the ROI.")
@@ -1111,7 +1169,8 @@ def build_parser():
                    help="Collapse below this (mm) counts as 'not collapsed'.")
     p.add_argument("--cut-length-cm", type=float, default=None,
                    help="Manual critical-cut length in cm; markers within it of the cut "
-                        "end are excluded as saw-cut (overrides auto detection).")
+                        "end are excluded as saw-cut (overrides auto detection). From the "
+                        "metadata file (saw_cut_cm) if unset.")
     p.add_argument("--no-exclude-saw", action="store_true",
                    help="Disable saw-cut exclusion (analyze all collapsed markers).")
     p.add_argument("--out", default="pst_results",
