@@ -989,10 +989,10 @@ def load_meta(args):
 
     The registry is JSON keyed by video name:
         {"<video stem>": {"saw_cut_cm", "fps", "column_length_cm", "cut_from", ...}}
-    Path is --meta, else "saw_cut.json" alongside the video. ROI/scale/static stay in
+    Path is --meta, else "metadata.json" alongside the video. ROI/scale/static stay in
     the per-video config (they can have variants and are machine-generated).
     """
-    path = args.meta or os.path.join(os.path.dirname(args.path) or ".", "saw_cut.json")
+    path = args.meta or os.path.join(os.path.dirname(args.path) or ".", "metadata.json")
     if not os.path.exists(path):
         return
     with open(path) as fh:
@@ -1112,7 +1112,7 @@ def build_parser():
     p.add_argument("-v", "--path", required=True, help="Path to the PST video file.")
     p.add_argument("--meta", default=None,
                    help="Per-video metadata registry JSON (saw cut, fps, column length, "
-                        "cut-from), keyed by video name. Defaults to 'saw_cut.json' next "
+                        "cut-from), keyed by video name. Defaults to 'metadata.json' next "
                         "to the video. Supplies any of those values not given on the CLI.")
     p.add_argument("--column-length-cm", type=float, default=None,
                    help="Isolated column length in cm (used to judge arrest). Required "
