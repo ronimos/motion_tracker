@@ -47,11 +47,20 @@ pip install numpy opencv-python pandas tqdm matplotlib
 
 ## Files
 
-- **`motion_tracker.py`** — the application (the `VideoUtil` tracker and Tkinter GUI).
+- **`video_tracker.py`** — the reusable tracking engine (the `VideoUtil` class):
+  load, ROI (rectangle or polygon), scale calibration, static zones, optical-flow
+  tracking with optional stabilization. No GUI.
+- **`motion_tracker.py`** — the Tkinter GUI app and command-line entry point built
+  on `VideoUtil` (re-exported here, so `from motion_tracker import VideoUtil` still
+  works).
 - **`pst_analysis.py`** — Propagation Saw Test (PST) analysis built on the tracker
   (see [PST analysis](#pst-analysis-propagation-saw-test)).
-- **`pst_compare.py`** — compare collapse profiles across PST videos
+- **`pst_plots.py`** — all PST figures in one module: per-video plots (called by
+  `pst_analysis.py`) and the cross-video `compare`/`box` commands
   (see [Comparing videos](#comparing-videos)).
+- **`run_pipeline.py`** — runs the whole workflow start to finish: per-video
+  `pst_analysis.py --reuse --stabilize` for each video in `metadata.json`, then the
+  `pst_plots.py` comparison figures (see [Running the pipeline](#running-the-pipeline)).
 - **`archive/`** — the superseded original implementation, kept for reference only.
 
 ## Usage
@@ -288,23 +297,50 @@ tool warns when the speed fit is poor (R² low / near-simultaneous onsets) — t
 usually means the front crossed the tracked span faster than the fps resolves, so you
 need a higher frame rate or a longer tracked span (not a code problem).
 
-### Comparing videos
+### Running the pipeline
 
-`pst_compare.py` reads the per-video outputs and compares the collapse magnitude
-along the column between videos, each aligned to its own saw-cut length:
+`run_pipeline.py` runs everything end to end from the existing per-video configs
+and `metadata.json`: it analyzes each video (`pst_analysis.py --reuse --stabilize`),
+then builds the cross-video comparison figures.
 
 ```bash
-python pst_compare.py --base pst_results          # compare every video under pst_results/
-python pst_compare.py pst_results/PST_01 pst_results/PST_02 --out pst_results/_compare
+python run_pipeline.py                    # analyze all + build comparisons
+python run_pipeline.py --only Beehive_3   # just one (or a few) videos
+python run_pipeline.py --skip-analysis    # only rebuild the comparison plots
 ```
 
-It writes `collapse_comparison.png` — two panels: collapse magnitude vs distance from
-the saw cut (absolute profiles, one curve per video), and the same normalized to the
-near-cut collapse (so the *relative* change as the crack runs is comparable between
-videos: rising = collapse grows with propagation, falling = damping). It also writes
-`collapse_comparison.csv` with per-video stats: critical cut, near/far collapse, the
-collapse slope (mm/m), and the far/near ratio. Bad tracks and out-of-column markers
-are excluded.
+Stabilization is on by default; to analyze a specific clip without it (e.g. one the
+stabilizer inverts), add `"stabilize": false` to that video's entry in
+`metadata.json` — the per-video value overrides the global `--no-stabilize` default.
+Videos without a saved config are skipped (run the interactive setup once first).
+
+### Comparing videos
+
+`pst_plots.py` reads the per-video outputs and compares videos. Every figure —
+per-video and cross-video — draws from one collapse-data definition
+(`collapse_sample`) aligned to each video's **measured critical cut**, so results
+stay consistent. Two cross-video subcommands:
+
+```bash
+python pst_plots.py compare --base pst_results    # collapse-profile comparison + stats CSV
+python pst_plots.py box --base pst_results \
+    --collapse-time 2026-03-17T09:40 --reference Beehive_0   # amplitude box plot
+```
+
+`compare` writes `collapse_comparison.png` — two panels: collapse magnitude vs
+distance from the cut (absolute profiles, one curve per video), and the same
+normalized to the near-cut collapse (so the *relative* change as the crack runs is
+comparable: rising = collapse grows with propagation, falling = damping) — plus
+`collapse_comparison.csv` with per-video stats (critical cut, near/far collapse,
+collapse slope mm/m, far/near ratio). Add `--color-by-time` to color each curve by
+its time relative to `--collapse-time`.
+
+`box` writes `collapse_comparison_box.png` — one box per video of its collapse
+amplitude (with the raw markers overlaid as jittered scatter, Tukey outliers
+dropped), placed on a time axis relative to the slope collapse; a far-back
+reference video gets its own panel via a broken x-axis. Both commands default
+their output to `<base>/_comparison/`. Bad tracks and out-of-column markers are
+excluded throughout.
 
 ## Notes
 

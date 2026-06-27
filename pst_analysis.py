@@ -44,7 +44,7 @@ import matplotlib
 matplotlib.use("Agg")  # headless-safe: figures are written to disk, never shown
 import matplotlib.pyplot as plt
 
-from motion_tracker import VideoUtil
+from video_tracker import VideoUtil
 
 
 class PSTAnalyzer:
@@ -72,7 +72,7 @@ class PSTAnalyzer:
     """
 
     def __init__(self, track, column_length_m, cut_from='left',
-                 onset_frac=0.10, touchdown_frac=0.90, min_collapse_mm=1.0,
+                 onset_frac=0.10, touchdown_frac=0.90, min_collapse_mm=0.25,
                  exclude_saw=True, cut_length_m=None):
         self.column_length = float(column_length_m)
         self.cut_from = cut_from
@@ -693,221 +693,12 @@ class PSTAnalyzer:
         table.to_csv(os.path.join(outdir, f"{prefix}_markers.csv"), index=False)
         traj = self.trajectory_table(window_only=not full_trajectories)
         traj.to_csv(os.path.join(outdir, f"{prefix}_trajectories.csv"), index=False)
-        self._plots(outdir, prefix)
+        import pst_plots
+        pst_plots.per_video_figures(self, outdir, prefix)
         scope = "full record" if full_trajectories else "propagation window"
         print(f"\nWrote summary, per-marker CSV, per-frame trajectories ({scope}), "
               f"and plots to: {outdir}/")
         return summary
-
-    # ------------------------------------------------------------------ #
-    # Plots
-    # ------------------------------------------------------------------ #
-    def _plots(self, outdir, prefix):
-        # 1) Collapse-vs-time curves, colored by along-column position so the
-        #    left-to-right propagation delay is visible. Window shaded.
-        fig, ax = plt.subplots(figsize=(8, 5))
-        idx = np.where(self.collapsed & self._valid())[0]
-        if idx.size:
-            order = idx[np.argsort(self.X[idx])]
-            xmin, xmax = self.X[order].min(), self.X[order].max()
-            cmap = plt.get_cmap("viridis")
-            for i in order:
-                frac = (self.X[i] - xmin) / (xmax - xmin) if xmax > xmin else 0.5
-                ax.plot(self.t, self.w[:, i], lw=1, alpha=0.85, color=cmap(frac))
-            sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(xmin, xmax))
-            fig.colorbar(sm, ax=ax, label="along-column position (m)")
-        ax.axvspan(self.t[self.win0], self.t[self.win1], color="orange", alpha=0.15,
-                   label="propagation window")
-        ax.set_xlabel("time (s)")
-        ax.set_ylabel("collapse (mm, downward +)")
-        ax.set_title("Slab marker collapse vs time (color = position)")
-        ax.legend(loc="upper left"); ax.grid(alpha=0.3)
-        fig.tight_layout(); fig.savefig(os.path.join(outdir, f"{prefix}_collapse_curves.png"), dpi=130)
-        plt.close(fig)
-
-        # 1b) Kymograph: collapse over (along-column position, time) - the
-        #     propagation front shows as a tilted edge; the window is marked.
-        fig, ax = plt.subplots(figsize=(9, 5))
-        incol = self._valid() & np.isfinite(self.X)
-        if incol.sum() >= 2:
-            nb = min(30, max(6, int(incol.sum())))
-            Xi = self.X[incol]
-            edges = np.linspace(Xi.min(), Xi.max(), nb + 1)
-            binid = np.clip(np.digitize(self.X, edges) - 1, 0, nb - 1)
-            ky = np.full((nb, self.w.shape[0]), np.nan)
-            for b in range(nb):
-                sel = incol & (binid == b)
-                if sel.any():
-                    ky[b] = np.nanmean(self.w[:, sel], axis=1)
-            im = ax.imshow(ky, aspect="auto", origin="lower", cmap="viridis",
-                           extent=[self.t[0], self.t[-1], Xi.min(), Xi.max()])
-            fig.colorbar(im, ax=ax, label="collapse (mm)")
-            ax.axvline(self.t[self.win0], color="white", ls="--", lw=1)
-            ax.axvline(self.t[self.win1], color="white", ls="--", lw=1)
-        ax.set_xlabel("time (s)"); ax.set_ylabel("along-column position (m)")
-        ax.set_title("Collapse kymograph (dashed = propagation window)")
-        fig.tight_layout(); fig.savefig(os.path.join(outdir, f"{prefix}_kymograph.png"), dpi=130)
-        plt.close(fig)
-
-        # 2) Onset time vs along-column position (crack speed)
-        fig, ax = plt.subplots(figsize=(8, 5))
-        prop = self._propagation_mask()
-        saw = self.saw_excluded & np.isfinite(self.onset)
-        ax.scatter(self.X[prop], self.onset[prop], s=25, c="tab:red", label="propagation")
-        if np.any(saw):
-            ax.scatter(self.X[saw], self.onset[saw], s=22, c="tab:gray", marker="x",
-                       label="saw-cut (excluded)")
-        if np.isfinite(self.speed) and hasattr(self, "_speed_fit"):
-            slope, intercept = self._speed_fit
-            xs = np.linspace(self.X[prop].min(), self.X[prop].max(), 50)
-            ax.plot(xs, slope * xs + intercept, "k--",
-                    label=f"fit: c = {self.speed:.1f} m/s  (R²={self.speed_r2:.2f})")
-        if self.critical_cut_length > 0:
-            ax.axvline(self.critical_cut_length, color="tab:purple", ls="-.",
-                       label=f"critical cut = {self.critical_cut_length:.2f} m")
-        ax.legend()
-        ax.set_xlabel("along-column position (m)")
-        ax.set_ylabel("collapse-onset time (s)")
-        ax.set_title("Crack propagation: onset time vs position")
-        ax.grid(alpha=0.3)
-        fig.tight_layout(); fig.savefig(os.path.join(outdir, f"{prefix}_crack_speed.png"), dpi=130)
-        plt.close(fig)
-
-        # 3) Collapse amplitude profile vs position (+ propagation distance / column end)
-        fig, ax = plt.subplots(figsize=(8, 5))
-        valid = self._valid()
-        coll = self.collapsed & valid
-        intact = (~self.collapsed) & valid
-        ax.scatter(self.X[coll], self.amp[coll], s=25, c="tab:blue", label="collapsed")
-        if np.any(intact):
-            ax.scatter(self.X[intact], self.amp[intact], s=18,
-                       c="lightgray", label="not collapsed")
-        ax.axvline(self.prop_distance, color="tab:green", ls="--",
-                   label=f"propagation = {self.prop_distance:.2f} m")
-        ax.axvline(self.marker_span, color="tab:orange", ls="-.",
-                   label=f"tracked extent = {self.marker_span:.2f} m")
-        ax.axvline(self.column_length, color="k", ls=":",
-                   label=f"column end = {self.column_length:.2f} m")
-        ax.set_xlabel("along-column position (m)")
-        ax.set_ylabel("collapse amplitude (mm)")
-        ax.set_title("Collapse profile along the column")
-        ax.legend(); ax.grid(alpha=0.3)
-        fig.tight_layout(); fig.savefig(os.path.join(outdir, f"{prefix}_collapse_profile.png"), dpi=130)
-        plt.close(fig)
-
-        # 3b) Collapse profile as a connecting LINE vs distance, with the saw-cut
-        #     region distinguished. Two variants (keep saw-cut in a separate color
-        #     / omit it) are written so we can compare and pick one later.
-        self._collapse_line_plot(outdir, prefix)
-
-        # 4) Marker overlay on the first frame (where the points are tracked)
-        if self.frame0 is not None:
-            fig, ax = plt.subplots(figsize=(10, 6))
-            ax.imshow(self.frame0[:, :, ::-1])      # BGR -> RGB
-            x0, y0 = self.pos[0, :, 0], self.pos[0, :, 1]
-            valid = self._valid()
-            cats = [
-                (~self.in_column, "red", "out of column (excluded)"),
-                (self.bad_track, "magenta", "bad track (excluded)"),
-                (self.saw_excluded & valid, "orange", "saw-cut (excluded)"),
-                (self.collapsed & valid & ~self.saw_excluded, "lime", "propagation"),
-                (~self.collapsed & valid & ~self.saw_excluded, "deepskyblue", "not collapsed"),
-            ]
-            for m, color, label in cats:
-                if np.any(m):
-                    ax.scatter(x0[m], y0[m], s=18, c=color, edgecolors="black",
-                               linewidths=0.4, label=f"{label} ({int(m.sum())})")
-            ax.set_title(f"Tracked markers (n={self.amp.size}) on first frame")
-            ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
-            ax.axis("off")
-            fig.tight_layout(); fig.savefig(os.path.join(outdir, f"{prefix}_markers_overlay.png"), dpi=130)
-            plt.close(fig)
-
-    def _collapse_line_plot(self, outdir, prefix):
-        """Collapse magnitude (mm) vs along-column distance (m) as a connecting
-        line - the slab's collapse profile.
-
-        The connecting line is a binned median of the *collapsed* markers only
-        (so it tracks where the slab actually dropped and isn't pulled to zero by
-        intact markers), while every marker is still drawn as a faint scatter -
-        collapsed in the region color, not-collapsed in gray - so the spatial
-        extent of the non-collapsing slab stays visible. Two variants are written:
-
-          *_collapse_line.png            - the whole column, with the saw-cut
-                                           region (X <= critical cut) as a separate
-                                           orange line, so saw-cut settling and the
-                                           crack collapse appear together.
-          *_collapse_line_no_sawcut.png  - saw-cut markers omitted entirely.
-
-        (Both are kept for now so we can decide which reads better.)
-        """
-        valid = self._valid()
-        X, A = self.X[valid], self.amp[valid]
-        saw = self.saw_excluded[valid]
-        coll = self.collapsed[valid]
-        if X.size < 2:
-            return
-
-        def binned(xs, ys):
-            if xs.size < 2:
-                return xs, ys
-            nb = int(min(25, max(5, xs.size // 4)))
-            edges = np.linspace(xs.min(), xs.max(), nb + 1)
-            bid = np.clip(np.digitize(xs, edges) - 1, 0, nb - 1)
-            bx, by = [], []
-            for b in range(nb):
-                sel = bid == b
-                if sel.any():
-                    bx.append(0.5 * (edges[b] + edges[b + 1]))
-                    by.append(np.median(ys[sel]))
-            return np.array(bx), np.array(by)
-
-        def draw_group(ax, m, color, line_kw, scatter_label=None):
-            """Faint scatter of all markers in mask m (collapsed in `color`,
-            not-collapsed in gray) plus a binned-median line of the collapsed ones."""
-            mc, mi = m & coll, m & ~coll
-            if np.any(mi):
-                ax.scatter(X[mi], A[mi], s=12, c="lightgray", alpha=0.6,
-                           label="not collapsed" if scatter_label else None)
-            if np.any(mc):
-                ax.scatter(X[mc], A[mc], s=12, c=color, alpha=0.30)
-                bx, by = binned(X[mc], A[mc])
-                ax.plot(bx, by, lw=2, ms=4, color=color, **line_kw)
-
-        cut = self.critical_cut_length
-        prop = ~saw
-
-        # Variant 1: full column, saw-cut region in a separate color.
-        fig, ax = plt.subplots(figsize=(8, 5))
-        draw_group(ax, prop, "tab:blue", dict(marker="o", label="collapse (propagation)"),
-                   scatter_label=True)
-        if np.any(saw):
-            draw_group(ax, saw, "tab:orange", dict(marker="s", label="saw-cut region"))
-        if cut > 0:
-            ax.axvline(cut, color="tab:purple", ls="-.", label=f"critical cut = {cut:.2f} m")
-        ax.axvline(self.column_length, color="k", ls=":",
-                   label=f"column end = {self.column_length:.2f} m")
-        ax.set_xlabel("along-column distance (m)")
-        ax.set_ylabel("collapse magnitude (mm)")
-        ax.set_title("Collapse profile along the column")
-        ax.legend(); ax.grid(alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(os.path.join(outdir, f"{prefix}_collapse_line.png"), dpi=130)
-        plt.close(fig)
-
-        # Variant 2: saw-cut markers omitted entirely.
-        fig, ax = plt.subplots(figsize=(8, 5))
-        draw_group(ax, prop, "tab:blue", dict(marker="o", label="collapse"),
-                   scatter_label=True)
-        ax.axvline(self.column_length, color="k", ls=":",
-                   label=f"column end = {self.column_length:.2f} m")
-        ax.set_xlabel("along-column distance (m)")
-        ax.set_ylabel("collapse magnitude (mm)")
-        ax.set_title("Collapse profile along the column (saw-cut omitted)")
-        ax.legend(); ax.grid(alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(os.path.join(outdir, f"{prefix}_collapse_line_no_sawcut.png"), dpi=130)
-        plt.close(fig)
 
 
 def _round(v, n):
@@ -928,6 +719,15 @@ def _set_roi_from_arg(v, roi):
     mask = np.zeros_like(v.video_buffer[0])
     mask[y:y + h, x:x + w] = 255
     v.mask = mask
+    v.roi_polygon = None
+
+
+def _set_roi_polygon_from_arg(v, spec):
+    """Build a polygon ROI from 'x1,y1 x2,y2 ...' (or 'x1,y1,x2,y2,...')."""
+    nums = [int(s) for s in spec.replace(",", " ").split()]
+    if len(nums) < 6 or len(nums) % 2:
+        raise SystemExit("error: --roi-poly needs >= 3 'x,y' vertex pairs.")
+    v._mask_from_polygon(list(zip(nums[0::2], nums[1::2])))
 
 
 def _mask_bbox(mask_gray):
@@ -953,7 +753,11 @@ def save_config(v, path):
         "video": os.path.basename(v.video_file),
         "pix_width_m_per_px": float(v.pix_width),
         "pix_height_m_per_px": float(v.pix_height),
+        # roi_xywh is the bounding box (kept for reference); a polygon ROI, when
+        # used, is the authoritative shape and is restored from roi_polygon.
         "roi_xywh": _mask_bbox(roi_gray),
+        "roi_polygon": ([[int(x), int(y)] for x, y in v.roi_polygon]
+                        if getattr(v, "roi_polygon", None) else None),
         "static_zones_xywh": _rects_from_mask(v.stab_mask) if v.stab_mask is not None else [],
     }
     with open(path, "w") as fh:
@@ -967,8 +771,11 @@ def load_config(v, path):
         cfg = json.load(fh)
     v.pix_width = float(cfg["pix_width_m_per_px"])
     v.pix_height = float(cfg["pix_height_m_per_px"])
+    poly = cfg.get("roi_polygon")
     roi = cfg.get("roi_xywh")
-    if roi:
+    if poly:                                    # polygon ROI takes precedence
+        v._mask_from_polygon([(int(x), int(y)) for x, y in poly])
+    elif roi:
         x, y, w, h = roi
         mask = np.zeros_like(v.video_buffer[0])
         mask[y:y + h, x:x + w] = 255
@@ -1044,8 +851,13 @@ def run(args):
               f"{len(cfg.get('static_zones_xywh') or [])} static zone(s)")
     else:
         # 1) Region of interest = the slab (where markers/features live)
-        if args.roi:
+        if args.roi_poly:
+            _set_roi_polygon_from_arg(v, args.roi_poly)
+        elif args.roi:
             _set_roi_from_arg(v, args.roi)
+        elif args.roi_shape == "polygon":
+            print("Trace a POLYGON around the slab (click vertices), then Enter/Esc.")
+            v.set_roi_polygon()
         else:
             print("Draw a box around the slab markers (the part that collapses), then Esc.")
             v.set_roi()
@@ -1128,6 +940,12 @@ def build_parser():
                         "Uses --column-length-cm / the metadata file.")
     p.add_argument("--roi", default=None,
                    help="Slab ROI as 'x,y,w,h' in pixels. If omitted, draw it interactively.")
+    p.add_argument("--roi-shape", choices=["rect", "polygon"], default="rect",
+                   help="Interactive ROI shape. 'polygon' traces an arbitrary outline "
+                        "(for tilted/non-rectangular blocks); 'rect' (default) draws a box.")
+    p.add_argument("--roi-poly", default=None,
+                   help="Polygon ROI as '>=3 x,y vertex pairs (e.g. '10,20 300,40 280,200'). "
+                        "Non-interactive; overrides --roi/--roi-shape.")
     p.add_argument("--reuse", action="store_true",
                    help="Reuse the saved ROI/scale/static config for this video (skip the "
                         "interactive setup). The config is auto-saved on the first run.")
@@ -1165,7 +983,7 @@ def build_parser():
                         "the propagation window.")
     p.add_argument("--onset-frac", type=float, default=0.10,
                    help="Fraction of a marker's collapse used as the onset threshold.")
-    p.add_argument("--min-collapse-mm", type=float, default=1.0,
+    p.add_argument("--min-collapse-mm", type=float, default=0.25,
                    help="Collapse below this (mm) counts as 'not collapsed'.")
     p.add_argument("--cut-length-cm", type=float, default=None,
                    help="Manual critical-cut length in cm; markers within it of the cut "
